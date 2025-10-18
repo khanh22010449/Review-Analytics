@@ -290,9 +290,9 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, pos_weight
 # ---------- Data prepare ----------
 def prepare_data(csv_path=CSV_PATH):
     df = pd.read_csv(csv_path)
-    if 'review' not in df.columns:
+    if 'Review' not in df.columns:
         raise ValueError("CSV must contain column 'review'")
-    texts = df['review'].astype(str).tolist()
+    texts = df['Review'].astype(str).tolist()
     sample = df[ASPECT_COLS].copy()
     # Expect sample values are integers in 0..5
     rating_arr = sample.values.astype(int)
