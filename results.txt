@@ -1,0 +1,24 @@
+Multi-label presence metrics (per aspect):
+giai_tri: acc=0.8550, f1_micro=0.8550, f1_macro=0.7530, n_val=593
+luu_tru: acc=0.9157, f1_micro=0.9157, f1_macro=0.8718, n_val=593
+nha_hang: acc=0.9039, f1_micro=0.9039, f1_macro=0.6538, n_val=593
+an_uong: acc=0.9140, f1_micro=0.9140, f1_macro=0.9079, n_val=593
+van_chuyen: acc=0.9494, f1_micro=0.9494, f1_macro=0.9265, n_val=593
+mua_sam: acc=0.9545, f1_micro=0.9545, f1_macro=0.8613, n_val=593
+
+Aggregated multi-label (val set):
+overall_rows_exact_match_acc: 0.9154
+micro_f1: 0.9154
+macro_f1: 0.8630
+
+Sentiment (per-aspect) metrics:
+giai_tri: acc=0.5743, mae=0.5743, val_n=101
+luu_tru: acc=0.4590, mae=0.7295, val_n=122
+nha_hang: acc=0.5714, mae=0.8000, val_n=35
+an_uong: acc=0.6000, mae=0.5682, val_n=220
+van_chuyen: acc=0.4779, mae=0.6618, val_n=136
+mua_sam: acc=0.5192, mae=0.6538, val_n=52
+
+Aggregated sentiment:
+mean_sent_acc: 0.5336457227191876
+mean_sent_mae: 0.6645930500623685
