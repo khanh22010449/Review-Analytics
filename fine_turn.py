@@ -25,7 +25,7 @@ except Exception as e:
     raise ImportError("Please install peft (pip install peft). Error: " + str(e))
 
 # ---------------- CONFIG ----------------
-MODEL_NAME = "xlm-roberta-base"   # change if you prefer
+MODEL_NAME = "vinai/phobert-base"   # change if you prefer
 CSV_PATH = "./train-problem.csv"  # your training csv (must contain 'Review' + ASPECT_COLS)
 ASPECT_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
 
