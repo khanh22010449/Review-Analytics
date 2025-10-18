@@ -31,7 +31,7 @@ ASPECT_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
 
 MAX_LEN = 256
 BATCH_SIZE = 16
-EPOCHS = 6
+EPOCHS = 60
 HEAD_LR = 2e-5
 WEIGHT_DECAY = 0.01
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,8 +40,8 @@ IGNORE_INDEX = None   # not used; we treat 0 as a valid class
 ACCUMULATION_STEPS = 1
 USE_AMP = True
 FOCAL_GAMMA = 2.0
-PATIENCE = 3
-SAVE_PATH = "../lora_multitask_0to5_best.pth"
+PATIENCE = 10
+SAVE_PATH = "../lora_multitask_best.pth"
 
 # LoRA config
 LORA_R = 8
