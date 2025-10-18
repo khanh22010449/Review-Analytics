@@ -40,7 +40,7 @@ IGNORE_INDEX = None   # not used; we treat 0 as a valid class
 ACCUMULATION_STEPS = 1
 USE_AMP = True
 FOCAL_GAMMA = 2.0
-PATIENCE = 10
+PATIENCE = 60
 SAVE_PATH = "../lora_multitask_best.pth"
 
 # LoRA config
