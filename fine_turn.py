@@ -31,9 +31,9 @@ from sklearn.metrics import f1_score, accuracy_score, mean_absolute_error
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel, AdamW, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
-
+from torch.optim import AdamW
 
 RANDOM_SEED = 42
 LABEL_COLUMNS = ["giai_tri", "luu_tru", "nha_hang", "an_uong", "van_chuyen", "mua_sam"]
