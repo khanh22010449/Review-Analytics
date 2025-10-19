@@ -321,8 +321,8 @@ def train(
     y_train = train_df[LABEL_COLUMNS].values.astype(int)
     y_val = val_df[LABEL_COLUMNS].values.astype(int)
 
-    train_dataset = MultiLabelDataset(train_df['text'].tolist(), y_train, tokenizer, max_length=max_length)
-    val_dataset = MultiLabelDataset(val_df['text'].tolist(), y_val, tokenizer, max_length=max_length)
+    train_dataset = MultiLabelDataset(train_df['Review'].tolist(), y_train, tokenizer, max_length=max_length)
+    val_dataset = MultiLabelDataset(val_df['Review'].tolist(), y_val, tokenizer, max_length=max_length)
 
     # create sampler if requested
     if use_sampler:
