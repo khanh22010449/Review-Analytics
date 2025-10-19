@@ -34,11 +34,39 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 from torch.optim import AdamW
+from sklearn.utils.class_weight import compute_class_weight
 
 
 RANDOM_SEED = 42
 LABEL_COLUMNS = ["giai_tri", "luu_tru", "nha_hang", "an_uong", "van_chuyen", "mua_sam"]
 
+
+def compute_per_label_class_weights(df, labels, device='cpu'):
+    """
+    Tính weight nghịch đảo tần suất cho từng label (6 class mỗi label).
+    Trả về dict: {label_name: torch.tensor([w0..w5])}
+    """
+    weight_dict = {}
+    for lbl in labels:
+        y = df[lbl].astype(int).values
+        classes = np.arange(6)
+        present = np.unique(y)
+        if len(present) < len(classes):
+            cw = np.ones(len(classes), dtype=float)
+            if len(present) > 0:
+                cw_present = compute_class_weight(class_weight='balanced', classes=present, y=y)
+                for c, w in zip(present, cw_present):
+                    cw[int(c)] = float(w)
+                maxw = float(np.max(cw_present)) if len(cw_present) > 0 else 1.0
+                for c in classes:
+                    if c not in present:
+                        cw[int(c)] = maxw
+        else:
+            cw = compute_class_weight(class_weight='balanced', classes=classes, y=y).astype(float)
+        # chuẩn hóa trung bình = 1
+        cw = cw / np.mean(cw)
+        weight_dict[lbl] = torch.tensor(cw, dtype=torch.float).to(device)
+    return weight_dict
 
 def set_seed(seed: int = RANDOM_SEED):
     random.seed(seed)
