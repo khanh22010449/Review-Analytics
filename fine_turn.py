@@ -20,7 +20,7 @@ import os
 import random
 import argparse
 import unicodedata
-import regex as re 
+import re
 from typing import List, Dict
 
 import pandas as pd
@@ -31,9 +31,9 @@ from sklearn.metrics import f1_score, accuracy_score, mean_absolute_error
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel, AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
-from torch.optim import AdamW
+
 
 RANDOM_SEED = 42
 LABEL_COLUMNS = ["giai_tri", "luu_tru", "nha_hang", "an_uong", "van_chuyen", "mua_sam"]
@@ -196,6 +196,121 @@ class Multi_label_Model(nn.Module):
 # 4. train
 #########################
 
+def _paraphrase_generate_batch(model_name, texts, device='cuda', num_return_sequences=3, max_length=128, do_sample=True, top_p=0.9, temperature=0.8, num_beams=5):
+    """Generate paraphrases for a list of texts using a seq2seq model (T5 / mT5).
+    Returns list of lists: paraphrases_per_input[i] = [par1, par2, ...]
+    Note: requires model available locally or internet to download from HF.
+    """
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+    outs = []
+    model.eval()
+    with torch.no_grad():
+        for t in texts:
+            prefix = t
+            inputs = tokenizer(prefix, return_tensors='pt', truncation=True, max_length=256).to(device)
+            generated = model.generate(
+                **inputs,
+                max_length=max_length,
+                num_return_sequences=num_return_sequences,
+                do_sample=do_sample,
+                top_p=top_p,
+                temperature=temperature,
+                num_beams=num_beams,
+                early_stopping=True,
+                no_repeat_ngram_size=3
+            )
+            outs.append([tokenizer.decode(g, skip_special_tokens=True) for g in generated])
+    return outs
+
+
+def _semantic_filter(originals, candidates, embedder_model_name='sentence-transformers/all-mpnet-base-v2', min_sim=0.7, max_sim=0.95, device='cpu'):
+    """Filter paraphrase candidates by semantic similarity to original using sentence-transformers.
+    Returns list of filtered candidates per original input.
+    If sentence-transformers not installed, return candidates as-is.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer, util
+    except Exception:
+        # cannot filter; return unchanged
+        return candidates
+
+    embedder = SentenceTransformer(embedder_model_name, device=device)
+    filtered = []
+    for orig, cands in zip(originals, candidates):
+        orig_emb = embedder.encode(orig, convert_to_tensor=True)
+        cand_embs = embedder.encode(cands, convert_to_tensor=True)
+        sims = util.pytorch_cos_sim(orig_emb, cand_embs)[0].cpu().numpy()
+        keep = [c for c, s in zip(cands, sims) if (s >= min_sim and s <= max_sim)]
+        # if none kept, fallback to top-1
+        if len(keep) == 0 and len(cands) > 0:
+            # keep highest sim
+            idx = int(sims.argmax())
+            keep = [cands[idx]]
+        filtered.append(keep)
+    return filtered
+
+
+def paraphrase_augment_for_labels(df, text_col, labels, paraphrase_model_name, device='cuda', num_return_sequences=3, min_sim=0.7, max_sim=0.95, per_label_multiplier=None):
+    """Create paraphrase augmentations for samples with label>0 only.
+    per_label_multiplier: dict label->multiplier of how many paraphrases to create per sample.
+    Returns augmented DataFrame (original + paraphrases) and stats dict.
+    """
+    if per_label_multiplier is None:
+        per_label_multiplier = {lbl: 1 for lbl in labels}
+
+    # collect candidates to paraphrase: rows where any label>0
+    to_paraphrase_idx = []
+    to_paraphrase_texts = []
+    to_paraphrase_meta = []
+    for idx, row in df.iterrows():
+        for lbl in labels:
+            if int(row[lbl]) > 0:
+                to_paraphrase_idx.append(idx)
+                to_paraphrase_texts.append(str(row[text_col]))
+                to_paraphrase_meta.append(row.to_dict())
+                break
+
+    if len(to_paraphrase_texts) == 0:
+        return df.copy(), {"created": 0}
+
+    # generate paraphrases in batches
+    batch_size = 32
+    all_paraphrases = []
+    for i in range(0, len(to_paraphrase_texts), batch_size):
+        batch = to_paraphrase_texts[i:i+batch_size]
+        gen = _paraphrase_generate_batch(paraphrase_model_name, batch, device=device, num_return_sequences=num_return_sequences)
+        all_paraphrases.extend(gen)
+
+    # filter semantically
+    filtered = _semantic_filter(to_paraphrase_texts, all_paraphrases, min_sim=min_sim, max_sim=max_sim, device=device)
+
+    # Build augmented rows
+    new_rows = []
+    created = 0
+    for meta, cand_list in zip(to_paraphrase_meta, filtered):
+        # determine multiplier by first positive label
+        multiplier = 1
+        for lbl in labels:
+            if int(meta[lbl]) > 0:
+                multiplier = per_label_multiplier.get(lbl, 1)
+                break
+        # take up to multiplier paraphrases
+        for p in cand_list[:multiplier]:
+            new_meta = meta.copy()
+            new_meta[text_col] = p
+            new_rows.append(new_meta)
+            created += 1
+
+    if created == 0:
+        return df.copy(), {"created": 0}
+
+    df_aug = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    return df_aug, {"created": created}
+
+
+# --- Updated train() with paraphrase augmentation + CE+MAE combined loss support ---
 def train(
     df: pd.DataFrame,
     model_name: str = 'bert-base-multilingual-cased',
@@ -205,22 +320,63 @@ def train(
     lr: float = 2e-5,
     max_length: int = 256,
     val_size: float = 0.1,
-    device: str = None
+    device: str = None,
+    use_focal: bool = False,
+    use_sampler: bool = True,
+    use_paraphrase: bool = False,
+    paraphrase_model_name: str = 'VietAI/t5-small-paraphrase',
+    paraphrase_params: dict = None,
+    combine_ce_mae: bool = True
 ):
+    """Train pipeline with options:
+    - use_paraphrase: if True, will augment training df by paraphrase_augment_for_labels
+    - paraphrase_model_name: HF model name for paraphrase
+    - paraphrase_params: dict controlling num_return_sequences, min_sim, max_sim, per_label_multiplier
+    - combine_ce_mae: if True, loss = CE_mean + 0.5 * MAE_mean (helps ordinal learning)
+    """
     set_seed()
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # paraphrase augmentation if requested (only on training data)
+    if use_paraphrase:
+        paraphrase_params = paraphrase_params or {}
+        num_return_sequences = paraphrase_params.get('num_return_sequences', 3)
+        min_sim = paraphrase_params.get('min_sim', 0.72)
+        max_sim = paraphrase_params.get('max_sim', 0.95)
+        per_label_multiplier = paraphrase_params.get('per_label_multiplier', {lbl: 1 for lbl in LABEL_COLUMNS})
+
+        print('Running paraphrase augmentation on training set...')
+        # split first to avoid augmenting validation
+        train_df, val_df = train_test_split(df, test_size=val_size, random_state=RANDOM_SEED)
+        train_df_aug, stats = paraphrase_augment_for_labels(train_df, 'Review' if 'Review' in train_df.columns else 'review', LABEL_COLUMNS, paraphrase_model_name, device=device, num_return_sequences=num_return_sequences, min_sim=min_sim, max_sim=max_sim, per_label_multiplier=per_label_multiplier)
+        print('Paraphrase augmentation created', stats)
+        df_to_use = pd.concat([train_df_aug, val_df], ignore_index=True)
+        # after augmentation, we'll re-split to have validation holdout
+        train_df, val_df = train_test_split(df_to_use, test_size=val_size, random_state=RANDOM_SEED)
+    else:
+        train_df, val_df = train_test_split(df, test_size=val_size, random_state=RANDOM_SEED)
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    train_df, val_df = train_test_split(df, test_size=val_size, random_state=RANDOM_SEED)
+    # compute per-label class weights
+    class_weights = compute_per_label_class_weights(train_df, labels=LABEL_COLUMNS, device=device)
+    print("Per-label class weights (mean normalized):")
+    for k, v in class_weights.items():
+        print(k, v.cpu().numpy())
 
     y_train = train_df[LABEL_COLUMNS].values.astype(int)
     y_val = val_df[LABEL_COLUMNS].values.astype(int)
 
-    train_dataset = MultiLabelDataset(train_df['Review'].tolist(), y_train, tokenizer, max_length=max_length)
-    val_dataset = MultiLabelDataset(val_df['Review'].tolist(), y_val, tokenizer, max_length=max_length)
+    train_dataset = MultiLabelDataset(train_df['Review'].tolist() if 'Review' in train_df.columns else train_df['Review'].tolist(), y_train, tokenizer, max_length=max_length)
+    val_dataset = MultiLabelDataset(val_df['Review'].tolist() if 'Review' in val_df.columns else val_df['Review'].tolist(), y_val, tokenizer, max_length=max_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # create sampler if requested
+    if use_sampler:
+        sampler = make_weighted_sampler(train_df, labels=LABEL_COLUMNS)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     model = Multi_label_Model(model_name=model_name).to(device)
@@ -230,8 +386,14 @@ def train(
     total_steps = len(train_loader) * epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.06 * total_steps), num_training_steps=total_steps)
 
-    best_val_loss = float('inf')
+    best_val_f1 = 0.0
     os.makedirs(output_dir, exist_ok=True)
+
+    # prepare focal loss per label if required
+    focal_losses = {}
+    if use_focal:
+        for lbl in LABEL_COLUMNS:
+            focal_losses[lbl] = FocalLossMultiClass(gamma=2.0, weight=class_weights[lbl], reduction='mean').to(device)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -242,8 +404,34 @@ def train(
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs['loss']
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=None)
+            logits = outputs['logits']  # [B, num_labels, 6]
+
+            # compute loss per-head with weights or focal, and optional MAE
+            losses = []
+            mae_losses = []
+            for i, lbl in enumerate(LABEL_COLUMNS):
+                logit_i = logits[:, i, :]  # [B,6]
+                target_i = labels[:, i]  # [B]
+                if use_focal:
+                    loss_i = focal_losses[lbl](logit_i, target_i)
+                else:
+                    loss_f = nn.CrossEntropyLoss(weight=class_weights[lbl])
+                    loss_i = loss_f(logit_i, target_i)
+                losses.append(loss_i)
+
+                if combine_ce_mae:
+                    probs = torch.softmax(logit_i, dim=-1)
+                    exp = (probs * torch.arange(6.0).to(probs.device)).sum(dim=-1)
+                    mae_i = torch.abs(exp - target_i.float()).mean()
+                    mae_losses.append(mae_i)
+
+            loss_ce = torch.stack(losses).mean()
+            if combine_ce_mae:
+                loss_mae = torch.stack(mae_losses).mean()
+                loss = loss_ce + 0.5 * loss_mae
+            else:
+                loss = loss_ce
 
             optimizer.zero_grad()
             loss.backward()
@@ -253,19 +441,18 @@ def train(
             train_losses.append(loss.item())
             pbar.set_postfix({'loss': np.mean(train_losses)})
 
-        # Validation
-        val_metrics = test(model, val_loader, device=device, return_preds=False)
-        val_loss = val_metrics.get('loss', None)
-        print(f"Epoch {epoch} validation: ", val_metrics)
+        # Validation: compute preds and f1_macro per-label using test() helper
+        val_results = test(model, val_loader, device=device, return_preds=False)
+        print(f"Epoch {epoch} validation: ", val_results)
 
-        # save
-        model_path = os.path.join(output_dir, f'model_epoch_{epoch}.pt')
-        torch.save(model.state_dict(), model_path)
-        if val_loss is not None and val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # use f1_macro as main selection metric
+        val_f1 = val_results.get('f1_macro', 0.0)
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
             torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pt'))
+            print(f"Saved new best model at epoch {epoch} with f1_macro={val_f1:.4f}")
 
-    print('Training complete. Models saved to', output_dir)
+    print('Training complete. Best f1_macro:', best_val_f1)
     return model, tokenizer
 
 
