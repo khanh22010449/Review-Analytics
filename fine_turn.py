@@ -34,9 +34,38 @@ from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warm
 from tqdm import tqdm
 
 from torch.optim import AdamW
+from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import WeightedRandomSampler
 
 RANDOM_SEED = 42
 LABEL_COLUMNS = ["giai_tri", "luu_tru", "nha_hang", "an_uong", "van_chuyen", "mua_sam"]
+
+# --- Focal loss multiclass (per-head) ---
+import torch.nn.functional as F
+
+class FocalLossMultiClass(nn.Module):
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None, reduction: str = "mean"):
+        super().__init__()
+        self.gamma = gamma
+        # weight: tensor of shape [num_classes]
+        self.register_buffer("weight", weight if weight is not None else None)
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        # logits: [B, C], targets: [B]
+        log_p = F.log_softmax(logits, dim=-1)  # [B, C]
+        p = torch.exp(log_p)
+        # nll per sample
+        nll = F.nll_loss(log_p, targets, weight=self.weight, reduction='none')
+        # pt = p_{t}
+        pt = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+        loss = ((1 - pt) ** self.gamma) * nll
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss  # none
 
 
 def set_seed(seed: int = RANDOM_SEED):
@@ -121,6 +150,37 @@ def Clean_and_normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_per_label_class_weights(df: pd.DataFrame, labels: List[str] = LABEL_COLUMNS, device='cpu'):
+    """
+    Returns a dict: { label_name: torch.tensor([w0..w5], dtype=float) }
+    where weights are inverse-frequency normalized (so bigger weight for rarer classes).
+    """
+    weight_dict = {}
+    for lbl in labels:
+        y = df[lbl].astype(int).values
+        classes = np.arange(6)
+        # if some classes are missing, compute_class_weight will error; handle that
+        present = np.unique(y)
+        if len(present) < len(classes):
+            # compute on present classes and fill others with max weight
+            cw = np.ones(len(classes), dtype=float)
+            if len(present) > 0:
+                cw_present = compute_class_weight(class_weight='balanced', classes=present, y=y)
+                # assign
+                for c, w in zip(present, cw_present):
+                    cw[int(c)] = float(w)
+                # for absent classes, keep a large weight (max of present)
+                maxw = float(np.max(cw_present)) if len(cw_present)>0 else 1.0
+                for c in classes:
+                    if c not in present:
+                        cw[int(c)] = maxw
+        else:
+            cw = compute_class_weight(class_weight='balanced', classes=classes, y=y).astype(float)
+        # normalize so mean=1 to keep LR behaviour similar
+        cw = cw / np.mean(cw)
+        weight_dict[lbl] = torch.tensor(cw, dtype=torch.float).to(device)
+    return weight_dict
+
 #########################
 # Dataset
 #########################
@@ -192,6 +252,42 @@ class Multi_label_Model(nn.Module):
         return {'loss': loss, 'logits': logits}
 
 
+# --- function to create WeightedRandomSampler to oversample rare-class samples ---
+def make_weighted_sampler(df: pd.DataFrame, labels: List[str] = LABEL_COLUMNS):
+    """
+    Compute per-sample weights: for each sample, compute the max inverse-frequency weight
+    across the labels where sample has class >0. If sample all zeros, assign a small weight.
+    Returns sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    """
+    # compute class frequencies for each label
+    freqs = {lbl: df[lbl].value_counts().to_dict() for lbl in labels}
+    # per-label class weight inverse freq (higher for rare)
+    invfreq = {}
+    for lbl in labels:
+        total = len(df)
+        invfreq[lbl] = {cls: (1.0 / (freqs[lbl].get(cls, 0) + 1e-9)) for cls in range(6)}
+
+    weights = []
+    for idx, row in df.iterrows():
+        # choose the maximum rarity among non-zero (1..5) classes to prioritize samples with rare labels
+        sample_weight = 0.0
+        for lbl in labels:
+            cls = int(row[lbl])
+            w = invfreq[lbl].get(cls, 0.0)
+            # if cls == 0 (majority), give a small base weight (not zero)
+            if cls == 0:
+                w = w * 0.1
+            sample_weight = max(sample_weight, w)
+        # avoid zero
+        if sample_weight <= 0:
+            sample_weight = 1e-6
+        weights.append(sample_weight)
+    weights = np.array(weights, dtype=float)
+    # normalize weights to mean 1
+    weights = weights / np.mean(weights)
+    sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+    return sampler
+
 #########################
 # 4. train
 #########################
@@ -200,12 +296,14 @@ def train(
     df: pd.DataFrame,
     model_name: str = 'bert-base-multilingual-cased',
     output_dir: str = './model_out',
-    epochs: int = 50,
+    epochs: int = 3,
     batch_size: int = 16,
     lr: float = 2e-5,
     max_length: int = 256,
     val_size: float = 0.1,
-    device: str = None
+    device: str = None,
+    use_focal: bool = False,
+    use_sampler: bool = True
 ):
     set_seed()
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -214,13 +312,25 @@ def train(
 
     train_df, val_df = train_test_split(df, test_size=val_size, random_state=RANDOM_SEED)
 
+    # compute per-label class weights
+    class_weights = compute_per_label_class_weights(train_df, labels=LABEL_COLUMNS, device=device)
+    print("Per-label class weights (mean normalized):")
+    for k, v in class_weights.items():
+        print(k, v.cpu().numpy())
+
     y_train = train_df[LABEL_COLUMNS].values.astype(int)
     y_val = val_df[LABEL_COLUMNS].values.astype(int)
 
-    train_dataset = MultiLabelDataset(train_df['Review'].tolist(), y_train, tokenizer, max_length=max_length)
-    val_dataset = MultiLabelDataset(val_df['Review'].tolist(), y_val, tokenizer, max_length=max_length)
+    train_dataset = MultiLabelDataset(train_df['text'].tolist(), y_train, tokenizer, max_length=max_length)
+    val_dataset = MultiLabelDataset(val_df['text'].tolist(), y_val, tokenizer, max_length=max_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # create sampler if requested
+    if use_sampler:
+        sampler = make_weighted_sampler(train_df, labels=LABEL_COLUMNS)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     model = Multi_label_Model(model_name=model_name).to(device)
@@ -230,8 +340,14 @@ def train(
     total_steps = len(train_loader) * epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.06 * total_steps), num_training_steps=total_steps)
 
-    best_val_loss = float('inf')
+    best_val_f1 = 0.0
     os.makedirs(output_dir, exist_ok=True)
+
+    # prepare focal loss per label if required
+    focal_losses = {}
+    if use_focal:
+        for lbl in LABEL_COLUMNS:
+            focal_losses[lbl] = FocalLossMultiClass(gamma=2.0, weight=class_weights[lbl], reduction='mean').to(device)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -242,8 +358,22 @@ def train(
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs['loss']
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=None)
+            logits = outputs['logits']  # [B, num_labels, 6]
+
+            # compute loss per-head with weights or focal
+            losses = []
+            for i, lbl in enumerate(LABEL_COLUMNS):
+                logit_i = logits[:, i, :]  # [B,6]
+                target_i = labels[:, i]  # [B]
+                if use_focal:
+                    loss_i = focal_losses[lbl](logit_i, target_i)
+                else:
+                    # CrossEntropy with per-class weight
+                    loss_f = nn.CrossEntropyLoss(weight=class_weights[lbl])
+                    loss_i = loss_f(logit_i, target_i)
+                losses.append(loss_i)
+            loss = torch.stack(losses).mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -253,19 +383,18 @@ def train(
             train_losses.append(loss.item())
             pbar.set_postfix({'loss': np.mean(train_losses)})
 
-        # Validation
-        val_metrics = test(model, val_loader, device=device, return_preds=False)
-        val_loss = val_metrics.get('loss', None)
-        print(f"Epoch {epoch} validation: ", val_metrics)
+        # Validation: compute preds and f1_macro per-label using test() helper
+        val_results = test(model, val_loader, device=device, return_preds=False)
+        print(f"Epoch {epoch} validation: ", val_results)
 
-        # save
-        model_path = os.path.join(output_dir, f'model_epoch_{epoch}.pt')
-        torch.save(model.state_dict(), model_path)
-        if val_loss is not None and val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # use f1_macro as main selection metric
+        val_f1 = val_results.get('f1_macro', 0.0)
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
             torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pt'))
+            print(f"Saved new best model at epoch {epoch} with f1_macro={val_f1:.4f}")
 
-    print('Training complete. Models saved to', output_dir)
+    print('Training complete. Best f1_macro:', best_val_f1)
     return model, tokenizer
 
 
