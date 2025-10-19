@@ -33,7 +33,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup, AdamW
+from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup
+from torch.optim import AdamW
 from tqdm import tqdm
 
 # ----------------------
