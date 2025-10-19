@@ -53,10 +53,10 @@ def set_seed(seed: int = RANDOM_SEED):
 
 def Load_data(path: str = "/mnt/data/train-problem.csv", text_col_candidates: List[str] = None) -> pd.DataFrame:
     """Đọc CSV và chuẩn hoá tên cột.
-    Trả về DataFrame chứa cột 'text' và các cột label trong LABEL_COLUMNS.
+    Trả về DataFrame chứa cột 'Review' và các cột label trong LABEL_COLUMNS.
     """
     if text_col_candidates is None:
-        text_col_candidates = ["Review", "review", "review_text", "content"]
+        text_col_candidates = ["text", "review", "review_text", "content"]
 
     df = pd.read_csv(path)
     # tìm cột text
@@ -69,7 +69,7 @@ def Load_data(path: str = "/mnt/data/train-problem.csv", text_col_candidates: Li
         # nếu không có, lấy cột đầu tiên
         text_col = df.columns[0]
 
-    df = df.rename(columns={text_col: "Review"})
+    df = df.rename(columns={text_col: "text"})
 
     # đảm bảo có đủ nhãn
     for lbl in LABEL_COLUMNS:
@@ -78,7 +78,7 @@ def Load_data(path: str = "/mnt/data/train-problem.csv", text_col_candidates: Li
             df[lbl] = 0
 
     # giữ chỉ các cột cần thiết
-    keep = ["Review"] + LABEL_COLUMNS
+    keep = ["text"] + LABEL_COLUMNS
     return df[keep]
 
 
@@ -368,8 +368,8 @@ def train(
     y_train = train_df[LABEL_COLUMNS].values.astype(int)
     y_val = val_df[LABEL_COLUMNS].values.astype(int)
 
-    train_dataset = MultiLabelDataset(train_df['Review'].tolist() if 'Review' in train_df.columns else train_df['Review'].tolist(), y_train, tokenizer, max_length=max_length)
-    val_dataset = MultiLabelDataset(val_df['Review'].tolist() if 'Review' in val_df.columns else val_df['Review'].tolist(), y_val, tokenizer, max_length=max_length)
+    train_dataset = MultiLabelDataset(train_df['Review'].tolist() if 'Review' in train_df.columns else train_df['review'].tolist(), y_train, tokenizer, max_length=max_length)
+    val_dataset = MultiLabelDataset(val_df['Review'].tolist() if 'Review' in val_df.columns else val_df['review'].tolist(), y_val, tokenizer, max_length=max_length)
 
     # create sampler if requested
     if use_sampler:
@@ -555,7 +555,7 @@ if __name__ == '__main__':
     parser.add_argument('--data', type=str, default='./train-problem.csv')
     parser.add_argument('--model_name', type=str, default='bert-base-multilingual-cased')
     parser.add_argument('--out', type=str, default='./model_out')
-    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--bs', type=int, default=16)
     parser.add_argument('--lr', type=float, default=2e-5)
     args = parser.parse_args()
