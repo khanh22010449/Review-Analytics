@@ -51,12 +51,23 @@ def set_seed(seed=RANDOM_SEED):
     torch.cuda.manual_seed_all(seed)
 
 def clean_text(s: str) -> str:
+    """
+    Làm sạch và chuẩn hoá chuỗi tiếng Việt:
+    - normalize Unicode (NFC)
+    - lowercase
+    - giữ lại chữ (Unicode letters), chữ số, dấu câu thông dụng và khoảng trắng
+    - thay mọi phần không hợp lệ bằng một khoảng trắng
+    """
     if not isinstance(s, str):
         return ""
     s = s.strip()
     s = unicodedata.normalize('NFC', s)
     s = s.lower()
-    s = re.sub(r"[^\\w\\s\\.,!?\\-:;'\"àáảãạăằắẵặâầấẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵñçươạêăđ0-9]+", " ", s)
+    # Sử dụng \p{L} (unicode letters) và \p{N} (unicode numbers) để hỗ trợ tiếng Việt tốt,
+    # đồng thời giữ các dấu câu thường gặp và ký tự gạch nối đã được escape.
+    # Lưu ý: ta đang dùng module `regex` (import regex as re), nên \p{L} được hỗ trợ.
+    s = re.sub(r"[^\p{L}\p{N}\s\.,!?\-:;'\"()]+", " ", s)
+    # collapse multiple whitespaces
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
