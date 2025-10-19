@@ -20,7 +20,7 @@ import os
 import random
 import argparse
 import unicodedata
-import relax as re 
+import regex as re 
 from typing import List, Dict
 
 import pandas as pd
