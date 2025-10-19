@@ -116,6 +116,8 @@ def compute_class_weights(df, device='cpu'):
     for lbl in LABEL_COLUMNS:
         counts = df[lbl].value_counts().reindex(range(K_CLASSES), fill_value=0).values.astype(float)
         inv = (N / (counts + 1e-6))
+        # mạnh hoá: bình phương inverse frequency, sau đó normalize mean=1
+        inv = (inv ** 2)
         inv = inv / inv.mean()
         weights[lbl] = torch.tensor(inv, dtype=torch.float, device=device)
     return weights
@@ -337,7 +339,7 @@ def main():
     parser.add_argument('--use_sampler', action='store_true')
     parser.add_argument('--unfreeze_last', type=int, default=2)
     parser.add_argument('--max_time', type=int, default=1800)  # seconds
-    parser.add_argument('--patience', type=int, default=2)
+    parser.add_argument('--patience', type=int, default=5)
     args = parser.parse_args()
 
     print("Loading data:", args.data)
