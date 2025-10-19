@@ -20,7 +20,7 @@ import os
 import random
 import argparse
 import unicodedata
-import re
+import regex as re
 from typing import List, Dict
 
 import pandas as pd
@@ -31,8 +31,9 @@ from sklearn.metrics import f1_score, accuracy_score, mean_absolute_error
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel, AdamW, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
+from torch.optim import AdamW
 
 
 RANDOM_SEED = 42
