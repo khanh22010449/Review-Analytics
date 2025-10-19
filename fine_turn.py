@@ -455,7 +455,7 @@ def main():
     parser.add_argument('--use_sampler', action='store_true')
     parser.add_argument('--unfreeze_last', type=int, default=0)
     parser.add_argument('--max_time', type=int, default=1800)
-    parser.add_argument('--patience', type=int, default=2)
+    parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--classification_only', action='store_true')
     parser.add_argument('--inspect', action='store_true', help='print sample predictions after each validation')
     args = parser.parse_args()
