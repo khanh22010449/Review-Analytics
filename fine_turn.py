@@ -42,9 +42,25 @@ def clean_text(s: str) -> str:
     s = s.strip()
     s = unicodedata.normalize('NFC', s)
     s = s.lower()
-    # keep unicode letters/numbers and basic punctuation
-    s = re.sub(r"[^\p{L}\p{N}\s\.,!?\\-:;'\"()]+", " ", s)
+    s = re.sub(r"[^\p{L}\p{N}\s\.,!?\-:;'\"()]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
+    return 
+
+    
+def clean_text(s: str) -> str:
+    import regex as reg
+    import unicodedata
+    if not isinstance(s, str):
+        return ""
+    s = s.strip()
+    s = unicodedata.normalize('NFC', s)
+    s = s.lower()
+    # Cho phép: chữ unicode (\p{L}), số (\p{N}), khoảng trắng, và ký tự câu thông dụng
+    # Lưu ý: đặt dấu - và ngoặc vào class được escape để tránh phạm vi không hợp lệ
+    pattern = r"[^\p{L}\p{N}\s\.,!?:;'\-\(\)\"/]+"
+    s = reg.sub(pattern, " ", s)
+    # gộp nhiều khoảng trắng thành 1
+    s = reg.sub(r"\s+", " ", s).strip()
     return s
 
 # -------------------------
