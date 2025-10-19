@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+fine_turn.py - Phiên bản chỉnh sửa cho hackathon
+- LR riêng cho head/encoder
+- classification_only flag để ưu tiên Micro-F1 nhanh
+- inspect_val_samples để debug mẫu
+- sửa clean_text an toàn với regex
+- torch.amp.autocast('cuda', ...) dùng thay cho deprecated API
+"""
 import os
 import time
 import argparse
@@ -5,12 +15,11 @@ import random
 import unicodedata
 import regex as re
 from typing import List, Optional, Dict
-import math
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score, mean_absolute_error
+from sklearn.metrics import f1_score
 
 import torch
 import torch.nn as nn
@@ -20,16 +29,12 @@ from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warm
 from torch.optim import AdamW
 from tqdm import tqdm
 
-# -------------------------
-# Config / labels
-# -------------------------
+# ---------- Config labels ----------
 RANDOM_SEED = 42
 LABEL_COLUMNS = ["giai_tri", "luu_tru", "nha_hang", "an_uong", "van_chuyen", "mua_sam"]
-K_CLASSES = 6  # classes 0..5
+K_CLASSES = 6  # 0..5
 
-# -------------------------
-# Utils
-# -------------------------
+# ---------- Utils ----------
 def set_seed(seed=RANDOM_SEED):
     random.seed(seed)
     np.random.seed(seed)
@@ -46,65 +51,45 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return 
 
-    
-def clean_text(s: str) -> str:
-    import regex as reg
-    import unicodedata
-    if not isinstance(s, str):
-        return ""
-    s = s.strip()
-    s = unicodedata.normalize('NFC', s)
-    s = s.lower()
-    # Cho phép: chữ unicode (\p{L}), số (\p{N}), khoảng trắng, và ký tự câu thông dụng
-    # Lưu ý: đặt dấu - và ngoặc vào class được escape để tránh phạm vi không hợp lệ
-    pattern = r"[^\p{L}\p{N}\s\.,!?:;'\-\(\)\"/]+"
-    s = reg.sub(pattern, " ", s)
-    # gộp nhiều khoảng trắng thành 1
-    s = reg.sub(r"\s+", " ", s).strip()
-    return s
-
-# -------------------------
-# Dataset
-# -------------------------
+# ---------- Dataset ----------
 class MultiLabelTextDataset(Dataset):
-    def __init__(self, texts: List[str], labels: np.ndarray, tokenizer: AutoTokenizer, max_length: int = 128):
+    def __init__(self, texts: List[str], labels: np.ndarray, tokenizer: AutoTokenizer, max_length: int = 128, return_text: bool = False):
         self.texts = texts
-        self.labels = labels  # shape [N, L]
+        self.labels = labels
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.return_text = return_text
 
     def __len__(self):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        txt = clean_text(self.texts[idx])
+        raw = self.texts[idx]
+        txt = clean_text(raw)
         enc = self.tokenizer(txt, truncation=True, padding='max_length', max_length=self.max_length, return_tensors='pt')
         item = {k: v.squeeze(0) for k, v in enc.items()}
         item['labels'] = torch.tensor(self.labels[idx], dtype=torch.long)
+        if self.return_text:
+            item['raw_text'] = raw
         return item
 
-# -------------------------
-# Model
-# -------------------------
+# ---------- Model ----------
 class MultiTaskModel(nn.Module):
     def __init__(self, backbone_name='vinai/phobert-base', proj_dim=512, mid_dim=256, dropout=0.2):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(backbone_name)
         hidden_size = self.encoder.config.hidden_size
-        # small MLP
         self.proj = nn.Linear(hidden_size, proj_dim)
         self.ln1 = nn.LayerNorm(proj_dim)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(proj_dim, mid_dim)
         self.ln2 = nn.LayerNorm(mid_dim)
-        # heads
         self.class_heads = nn.ModuleList([nn.Linear(mid_dim, K_CLASSES) for _ in LABEL_COLUMNS])
         self.reg_heads = nn.ModuleList([nn.Linear(mid_dim, 1) for _ in LABEL_COLUMNS])
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        # pooled: use pooler_output if available, else mean pool
         if hasattr(out, 'pooler_output') and out.pooler_output is not None:
             pooled = out.pooler_output
         else:
@@ -122,21 +107,19 @@ class MultiTaskModel(nn.Module):
         x = self.ln2(x)
         x = self.act(x)
         x = self.drop(x)
-        logits = torch.stack([h(x) for h in self.class_heads], dim=1)   # [B, L, K]
-        regs = torch.stack([h(x).squeeze(-1) for h in self.reg_heads], dim=1)  # [B, L]  (raw regression)
+        logits = torch.stack([h(x) for h in self.class_heads], dim=1)  # [B, L, K]
+        regs = torch.stack([h(x).squeeze(-1) for h in self.reg_heads], dim=1)  # [B, L] raw
         return {'logits': logits, 'regs': regs}
 
-# -------------------------
-# Losses and helpers
-# -------------------------
+# ---------- Loss & helpers ----------
 class FocalCELoss(nn.Module):
     def __init__(self, gamma=1.0):
         super().__init__()
         self.gamma = gamma
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor, weight: Optional[torch.Tensor] = None):
-        # logits: [B, K], targets: [B], weight: [K] or None
-        ce = F.cross_entropy(logits, targets, weight=weight, reduction='none')  # [B]
+        # logits: [B,K], targets: [B], weight: [K] or None
+        ce = F.cross_entropy(logits, targets, weight=weight, reduction='none')
         if self.gamma == 0.0:
             return ce.mean()
         probs = F.softmax(logits, dim=-1)
@@ -145,17 +128,12 @@ class FocalCELoss(nn.Module):
         return loss.mean()
 
 def compute_class_weights_per_label(df: pd.DataFrame, labels: List[str] = LABEL_COLUMNS, k: int = K_CLASSES, device='cpu'):
-    """
-    Return dict[label] = torch.tensor([w0..w_{k-1}]) normalized mean=1
-    Stronger weighting for rare classes.
-    """
     weights = {}
     N = len(df)
     for lbl in labels:
         counts = df[lbl].value_counts().reindex(range(k), fill_value=0).values.astype(float)
         inv = (N / (counts + 1e-6))
-        # stronger effect for rare classes:
-        inv = inv ** 1.5
+        inv = inv ** 1.2  # nhẹ nhàng hơn exponent
         inv = inv / inv.mean()
         weights[lbl] = torch.tensor(inv, dtype=torch.float, device=device)
     return weights
@@ -173,49 +151,56 @@ def make_weighted_sampler(df: pd.DataFrame, labels: List[str] = LABEL_COLUMNS, k
     weights = weights / np.mean(weights)
     return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
 
-# -------------------------
-# Evaluation (competition metrics)
-# -------------------------
+# ---------- Evaluation (competition metrics) ----------
 def evaluate_comp(model, dataloader, device):
     model.eval()
     all_preds = []
     all_labels = []
-    all_regs = []
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)  # [B, L]
+            labels = batch['labels'].to(device)
             out = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = out['logits'].cpu().numpy()    # [B, L, K]
-            regs = out['regs'].cpu().numpy()        # [B, L]
-            preds = np.argmax(logits, axis=-1)      # [B, L]
-            regs_round = np.round(np.clip(regs, 0, K_CLASSES-1)).astype(int)
+            logits = out['logits'].cpu().numpy()
+            preds = np.argmax(logits, axis=-1)
             all_preds.append(preds)
-            all_regs.append(regs_round)
             all_labels.append(labels.cpu().numpy())
     all_preds = np.concatenate(all_preds, axis=0)
-    all_regs = np.concatenate(all_regs, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
-
-    # Micro-F1: flatten across labels and samples
     micro_f1 = float(f1_score(all_labels.flatten(), all_preds.flatten(), average='micro', zero_division=0))
-
-    # Sentiment Quality: accuracy of predicted sentiment (pred == gt) but only where GT > 0
     mask = (all_labels > 0)
     if mask.sum() == 0:
         sentiment_acc = 0.0
     else:
         correct = ((all_preds == all_labels) & mask).sum()
         sentiment_acc = float(correct / mask.sum())
+    return {'micro_f1': micro_f1, 'sentiment_acc': sentiment_acc}
 
-    # Also provide per-label metrics for debugging
-    metrics = {'micro_f1': micro_f1, 'sentiment_acc': sentiment_acc}
-    return metrics
+def inspect_val_samples(model, val_loader, device, n=10):
+    model.eval()
+    printed = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            raws = batch.get('raw_text', None)
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = out['logits'].cpu().numpy()
+            preds = np.argmax(logits, axis=-1)
+            B = preds.shape[0]
+            for i in range(B):
+                text = raws[i] if raws is not None else "<no-text>"
+                print("TEXT:", text)
+                print("GT:", labels[i].cpu().numpy())
+                print("PRED:", preds[i])
+                print("-" * 60)
+                printed += 1
+                if printed >= n:
+                    return
 
-# -------------------------
-# Train loop
-# -------------------------
+# ---------- EMA ----------
 class ModelEMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
@@ -232,19 +217,23 @@ class ModelEMA:
                 sd[k].copy_(self.shadow[k].to(sd[k].device))
         model.load_state_dict(sd)
 
+# ---------- Train loop ----------
 def train_loop(df: pd.DataFrame,
                model_name: str = 'vinai/phobert-base',
                out_dir: str = './out',
                epochs: int = 6,
                bs: int = 16,
                max_len: int = 128,
-               lr: float = 2e-5,
+               lr_head: float = 1e-3,
+               lr_encoder: float = 1e-5,
                focal_gamma: float = 1.0,
                mae_weight: float = 0.1,
                use_sampler: bool = True,
                unfreeze_last: int = 0,
                max_time: int = 1800,
                patience: int = 2,
+               classification_only: bool = False,
+               inspect_flag: bool = False,
                device: Optional[str] = None):
     set_seed()
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -255,8 +244,8 @@ def train_loop(df: pd.DataFrame,
     train_labels = train_df[LABEL_COLUMNS].values.astype(int)
     val_labels = val_df[LABEL_COLUMNS].values.astype(int)
 
-    train_ds = MultiLabelTextDataset(train_df['text'].tolist(), train_labels, tokenizer, max_length=max_len)
-    val_ds = MultiLabelTextDataset(val_df['text'].tolist(), val_labels, tokenizer, max_length=max_len)
+    train_ds = MultiLabelTextDataset(train_df['text'].tolist(), train_labels, tokenizer, max_length=max_len, return_text=False)
+    val_ds = MultiLabelTextDataset(val_df['text'].tolist(), val_labels, tokenizer, max_length=max_len, return_text=True)
 
     if use_sampler:
         sampler = make_weighted_sampler(train_df)
@@ -265,12 +254,10 @@ def train_loop(df: pd.DataFrame,
         train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False)
 
-    # class weights per label
     class_weights = compute_class_weights_per_label(train_df, device=device)
 
-    # model
     model = MultiTaskModel(backbone_name=model_name)
-    # freeze encoder except last N layers (unfreeze_last default 0 -> freeze all)
+    # freeze encoder except last N layers
     try:
         num_layers = model.encoder.config.num_hidden_layers
     except:
@@ -285,20 +272,34 @@ def train_loop(df: pd.DataFrame,
                         break
     # ensure heads trainable
     for n, p in model.named_parameters():
-        if 'class_heads' in n or 'reg_heads' in n or 'proj' in n or 'fc2' in n:
+        if 'class_heads' in n or 'reg_heads' in n or 'proj' in n or 'fc2' in n or 'ln' in n:
             p.requires_grad = True
 
     model.to(device)
 
-    # optimizer / scheduler
-    optim_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(optim_params, lr=lr, weight_decay=1e-2)
+    # optimizer param groups: head_params (fast LR) vs other_params (slow LR)
+    head_params = []
+    other_params = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(x in n for x in ['class_heads', 'reg_heads', 'proj', 'fc2', 'ln']):
+            head_params.append(p)
+        else:
+            other_params.append(p)
+
+    optim_groups = []
+    if head_params:
+        optim_groups.append({'params': head_params, 'lr': lr_head})
+    if other_params:
+        optim_groups.append({'params': other_params, 'lr': lr_encoder})
+
+    optimizer = AdamW(optim_groups, weight_decay=1e-2)
     total_steps = max(1, len(train_loader) * epochs)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.06 * total_steps), num_training_steps=total_steps)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device.startswith('cuda')))
     ema = ModelEMA(model, decay=0.999)
-
     loss_cls_fn = FocalCELoss(gamma=focal_gamma)
 
     best_score = -1e9
@@ -316,27 +317,29 @@ def train_loop(df: pd.DataFrame,
                 break
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)   # [B,L]
+            labels = batch['labels'].to(device)
 
-            with torch.cuda.amp.autocast(enabled=(device.startswith('cuda'))):
+            with torch.amp.autocast('cuda' if device.startswith('cuda') else None):
                 out = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = out['logits']   # [B,L,K]
                 regs = out['regs']       # [B,L]
                 loss_list = []
-                # per-label loss
                 for j, lbl in enumerate(LABEL_COLUMNS):
-                    logit_j = logits[:, j, :]   # [B,K]
-                    tgt_j = labels[:, j]        # [B]
+                    logit_j = logits[:, j, :]
+                    tgt_j = labels[:, j]
                     weight = class_weights[lbl] if class_weights is not None else None
                     loss_cls = loss_cls_fn(logit_j, tgt_j, weight=weight)
-                    loss_reg = F.l1_loss(regs[:, j], tgt_j.float())
-                    loss_list.append(loss_cls + mae_weight * loss_reg)
+                    if classification_only:
+                        loss_list.append(loss_cls)
+                    else:
+                        loss_reg = F.l1_loss(regs[:, j], tgt_j.float())
+                        loss_list.append(loss_cls + mae_weight * loss_reg)
                 loss = torch.stack(loss_list).mean()
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(optim_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_([p for g in optim_groups for p in g['params']], max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -345,12 +348,11 @@ def train_loop(df: pd.DataFrame,
             losses.append(loss.item())
             pbar.set_postfix({'loss': float(np.mean(losses))})
 
-        # time cutoff
         if time.time() - start_time > max_time:
             print("Stopping due to max_time.")
             break
 
-        # Validation with EMA weights
+        # validation with EMA weights
         backup = {k: v.clone() for k, v in model.state_dict().items()}
         ema.copy_to(model)
         metrics = evaluate_comp(model, val_loader, device)
@@ -361,6 +363,10 @@ def train_loop(df: pd.DataFrame,
         overall = 0.7 * micro_f1 + 0.3 * sentiment_acc
 
         print(f"Epoch {epoch} val -> Micro-F1: {micro_f1:.4f}, SentimentAcc: {sentiment_acc:.4f}, Overall: {overall:.4f}")
+
+        if inspect_flag:
+            print("Inspecting some validation samples:")
+            inspect_val_samples(model, val_loader, device, n=6)
 
         if overall > best_score:
             best_score = overall
@@ -377,12 +383,9 @@ def train_loop(df: pd.DataFrame,
     print("Training finished. Best Overall:", best_score)
     return model, tokenizer
 
-# -------------------------
-# I/O
-# -------------------------
+# ---------- I/O helpers ----------
 def load_and_prepare_data(path: str):
     df = pd.read_csv(path)
-    # detect text column
     text_cols = ['text', 'review', 'content', 'Review']
     text_col = None
     for c in text_cols:
@@ -392,20 +395,15 @@ def load_and_prepare_data(path: str):
     if text_col is None:
         text_col = df.columns[0]
     df = df.rename(columns={text_col: 'text'})
-    # ensure labels
     for lbl in LABEL_COLUMNS:
         if lbl not in df.columns:
             df[lbl] = 0
-    # clean text
     df['text'] = df['text'].astype(str).apply(clean_text)
-    # fix labels
     for lbl in LABEL_COLUMNS:
         df[lbl] = pd.to_numeric(df[lbl], errors='coerce').fillna(0).astype(int).clip(0, K_CLASSES-1)
     return df[['text'] + LABEL_COLUMNS]
 
-# -------------------------
-# CLI main
-# -------------------------
+# ---------- CLI ----------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default='/mnt/data/train-problem.csv')
@@ -414,13 +412,16 @@ def main():
     parser.add_argument('--epochs', type=int, default=6)
     parser.add_argument('--bs', type=int, default=16)
     parser.add_argument('--max_len', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=2e-5)
+    parser.add_argument('--lr_head', type=float, default=1e-3)
+    parser.add_argument('--lr_encoder', type=float, default=1e-5)
     parser.add_argument('--focal_gamma', type=float, default=1.0)
     parser.add_argument('--mae_weight', type=float, default=0.1)
     parser.add_argument('--use_sampler', action='store_true')
     parser.add_argument('--unfreeze_last', type=int, default=0)
     parser.add_argument('--max_time', type=int, default=1800)
     parser.add_argument('--patience', type=int, default=2)
+    parser.add_argument('--classification_only', action='store_true')
+    parser.add_argument('--inspect', action='store_true', help='print sample predictions after each validation')
     args = parser.parse_args()
 
     print("Loading data:", args.data)
@@ -438,13 +439,16 @@ def main():
                                  epochs=args.epochs,
                                  bs=args.bs,
                                  max_len=args.max_len,
-                                 lr=args.lr,
+                                 lr_head=args.lr_head,
+                                 lr_encoder=args.lr_encoder,
                                  focal_gamma=args.focal_gamma,
                                  mae_weight=args.mae_weight,
                                  use_sampler=args.use_sampler,
                                  unfreeze_last=args.unfreeze_last,
                                  max_time=args.max_time,
                                  patience=args.patience,
+                                 classification_only=args.classification_only,
+                                 inspect_flag=args.inspect,
                                  device=device)
     print("Done. Best model saved at", os.path.join(args.out, 'best.pt'))
 
