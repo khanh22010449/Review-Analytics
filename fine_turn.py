@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fine_turn.py - Phiên bản chỉnh sửa cho hackathon
-- LR riêng cho head/encoder
-- classification_only flag để ưu tiên Micro-F1 nhanh
-- inspect_val_samples để debug mẫu
-- sửa clean_text an toàn với regex
-- torch.amp.autocast('cuda', ...) dùng thay cho deprecated API
+fine_turn.py - Phiên bản chỉnh sửa với collate_fn bảo vệ khỏi NoneType trong DataLoader
+- Giữ các cải tiến: backbone, MLP, focal loss, sampler, lr_head/lr_encoder, classification_only,...
+- Thêm collate_fn tùy chỉnh để tránh lỗi default_collate khi có trường raw_text hoặc None.
 """
 import os
 import time
@@ -42,14 +39,17 @@ def set_seed(seed=RANDOM_SEED):
     torch.cuda.manual_seed_all(seed)
 
 def clean_text(s: str) -> str:
+    """Sửa lỗi regex safe, giữ unicode letters & numbers và ký tự câu cơ bản."""
     if not isinstance(s, str):
         return ""
     s = s.strip()
     s = unicodedata.normalize('NFC', s)
     s = s.lower()
-    s = re.sub(r"[^\p{L}\p{N}\s\.,!?\-:;'\"()]+", " ", s)
+    # Escape '-' and include parentheses/quotes explicitly
+    pattern = r"[^\p{L}\p{N}\s\.,!?:;'\-\(\)\"/]+"
+    s = re.sub(pattern, " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    return 
+    return s
 
 # ---------- Dataset ----------
 class MultiLabelTextDataset(Dataset):
@@ -72,6 +72,40 @@ class MultiLabelTextDataset(Dataset):
         if self.return_text:
             item['raw_text'] = raw
         return item
+
+# ---------- collate_fn ----------
+def collate_fn(batch):
+    """
+    Collate that:
+     - stacks torch.Tensor fields (input_ids, attention_mask, labels)
+     - keeps other fields (like raw_text) as list (strings)
+    Also checks required fields not None.
+    """
+    if len(batch) == 0:
+        return {}
+    first = batch[0]
+    coll = {}
+    for key in first.keys():
+        vals = [d.get(key, None) for d in batch]
+        # sanity: required tensor fields must not contain None
+        if key in ('input_ids', 'attention_mask', 'labels'):
+            for i, v in enumerate(vals):
+                if v is None:
+                    raise ValueError(f"Found None for required field {key} in batch index {i}.")
+            # all should be tensors -> stack
+            if isinstance(vals[0], torch.Tensor):
+                coll[key] = torch.stack(vals, dim=0)
+            else:
+                # handle numpy arrays
+                try:
+                    coll[key] = torch.tensor(np.stack(vals, axis=0))
+                except Exception:
+                    # fallback: keep list
+                    coll[key] = vals
+        else:
+            # keep list as-is (strings or None)
+            coll[key] = vals
+    return coll
 
 # ---------- Model ----------
 class MultiTaskModel(nn.Module):
@@ -108,7 +142,7 @@ class MultiTaskModel(nn.Module):
         x = self.act(x)
         x = self.drop(x)
         logits = torch.stack([h(x) for h in self.class_heads], dim=1)  # [B, L, K]
-        regs = torch.stack([h(x).squeeze(-1) for h in self.reg_heads], dim=1)  # [B, L] raw
+        regs = torch.stack([h(x).squeeze(-1) for h in self.reg_heads], dim=1)  # [B, L]
         return {'logits': logits, 'regs': regs}
 
 # ---------- Loss & helpers ----------
@@ -118,7 +152,6 @@ class FocalCELoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor, weight: Optional[torch.Tensor] = None):
-        # logits: [B,K], targets: [B], weight: [K] or None
         ce = F.cross_entropy(logits, targets, weight=weight, reduction='none')
         if self.gamma == 0.0:
             return ce.mean()
@@ -133,7 +166,7 @@ def compute_class_weights_per_label(df: pd.DataFrame, labels: List[str] = LABEL_
     for lbl in labels:
         counts = df[lbl].value_counts().reindex(range(k), fill_value=0).values.astype(float)
         inv = (N / (counts + 1e-6))
-        inv = inv ** 1.2  # nhẹ nhàng hơn exponent
+        inv = inv ** 1.2
         inv = inv / inv.mean()
         weights[lbl] = torch.tensor(inv, dtype=torch.float, device=device)
     return weights
@@ -151,13 +184,14 @@ def make_weighted_sampler(df: pd.DataFrame, labels: List[str] = LABEL_COLUMNS, k
     weights = weights / np.mean(weights)
     return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
 
-# ---------- Evaluation (competition metrics) ----------
+# ---------- Evaluation ----------
 def evaluate_comp(model, dataloader, device):
     model.eval()
     all_preds = []
     all_labels = []
     with torch.no_grad():
         for batch in dataloader:
+            # collate_fn may keep raw_text as list; input tensors stacked
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
@@ -185,13 +219,13 @@ def inspect_val_samples(model, val_loader, device, n=10):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-            raws = batch.get('raw_text', None)
+            raws = batch.get('raw_text', [None] * input_ids.size(0))
             out = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = out['logits'].cpu().numpy()
             preds = np.argmax(logits, axis=-1)
             B = preds.shape[0]
             for i in range(B):
-                text = raws[i] if raws is not None else "<no-text>"
+                text = raws[i] if raws and raws[i] is not None else "<no-text>"
                 print("TEXT:", text)
                 print("GT:", labels[i].cpu().numpy())
                 print("PRED:", preds[i])
@@ -249,10 +283,10 @@ def train_loop(df: pd.DataFrame,
 
     if use_sampler:
         sampler = make_weighted_sampler(train_df)
-        train_loader = DataLoader(train_ds, batch_size=bs, sampler=sampler)
+        train_loader = DataLoader(train_ds, batch_size=bs, sampler=sampler, collate_fn=collate_fn)
     else:
-        train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False)
+        train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, collate_fn=collate_fn)
 
     class_weights = compute_class_weights_per_label(train_df, device=device)
 
@@ -315,6 +349,7 @@ def train_loop(df: pd.DataFrame,
             if time.time() - start_time > max_time:
                 print("Max time reached — stopping training loop.")
                 break
+            # required fields checked in collate_fn
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
@@ -398,7 +433,8 @@ def load_and_prepare_data(path: str):
     for lbl in LABEL_COLUMNS:
         if lbl not in df.columns:
             df[lbl] = 0
-    df['text'] = df['text'].astype(str).apply(clean_text)
+    # convert to str before cleaning to avoid None
+    df['text'] = df['text'].astype(str).fillna("").apply(clean_text)
     for lbl in LABEL_COLUMNS:
         df[lbl] = pd.to_numeric(df[lbl], errors='coerce').fillna(0).astype(int).clip(0, K_CLASSES-1)
     return df[['text'] + LABEL_COLUMNS]
