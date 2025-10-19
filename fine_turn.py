@@ -68,7 +68,7 @@ def Load_data(path: str = "/mnt/data/train-problem.csv", text_col_candidates: Li
         # nếu không có, lấy cột đầu tiên
         text_col = df.columns[0]
 
-    df = df.rename(columns={text_col: "text"})
+    df = df.rename(columns={text_col: "Review"})
 
     # đảm bảo có đủ nhãn
     for lbl in LABEL_COLUMNS:
@@ -77,7 +77,7 @@ def Load_data(path: str = "/mnt/data/train-problem.csv", text_col_candidates: Li
             df[lbl] = 0
 
     # giữ chỉ các cột cần thiết
-    keep = ["text"] + LABEL_COLUMNS
+    keep = ["Review"] + LABEL_COLUMNS
     return df[keep]
 
 
@@ -112,7 +112,7 @@ def Clean_and_normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     - Chuyển labels thành int và đảm bảo trong [0,5]
     """
     df = df.copy()
-    df['text'] = df['text'].astype(str).apply(clean_text)
+    df['Review'] = df['Review'].astype(str).apply(clean_text)
 
     for lbl in LABEL_COLUMNS:
         df[lbl] = pd.to_numeric(df[lbl], errors='coerce').fillna(0).astype(int)
@@ -217,8 +217,8 @@ def train(
     y_train = train_df[LABEL_COLUMNS].values.astype(int)
     y_val = val_df[LABEL_COLUMNS].values.astype(int)
 
-    train_dataset = MultiLabelDataset(train_df['text'].tolist(), y_train, tokenizer, max_length=max_length)
-    val_dataset = MultiLabelDataset(val_df['text'].tolist(), y_val, tokenizer, max_length=max_length)
+    train_dataset = MultiLabelDataset(train_df['Review'].tolist(), y_train, tokenizer, max_length=max_length)
+    val_dataset = MultiLabelDataset(val_df['Review'].tolist(), y_val, tokenizer, max_length=max_length)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -353,7 +353,7 @@ def test(model_or_path, dataloader=None, device: str = None, return_preds: bool 
 def prepare_dataloader_from_df(df: pd.DataFrame, tokenizer_name: str, batch_size: int = 16, max_length: int = 256):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     labels = df[LABEL_COLUMNS].values.astype(int)
-    ds = MultiLabelDataset(df['text'].tolist(), labels, tokenizer, max_length=max_length)
+    ds = MultiLabelDataset(df['Review'].tolist(), labels, tokenizer, max_length=max_length)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
     return loader
 
