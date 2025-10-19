@@ -53,7 +53,7 @@ def set_seed(seed: int = RANDOM_SEED):
 
 def Load_data(path: str = "/mnt/data/train-problem.csv", text_col_candidates: List[str] = None) -> pd.DataFrame:
     """Đọc CSV và chuẩn hoá tên cột.
-    Trả về DataFrame chứa cột 'Review' và các cột label trong LABEL_COLUMNS.
+    Trả về DataFrame chứa cột 'text' và các cột label trong LABEL_COLUMNS.
     """
     if text_col_candidates is None:
         text_col_candidates = ["text", "review", "review_text", "content"]
@@ -113,7 +113,7 @@ def Clean_and_normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     - Chuyển labels thành int và đảm bảo trong [0,5]
     """
     df = df.copy()
-    df['Review'] = df['Review'].astype(str).apply(clean_text)
+    df['text'] = df['text'].astype(str).apply(clean_text)
 
     for lbl in LABEL_COLUMNS:
         df[lbl] = pd.to_numeric(df[lbl], errors='coerce').fillna(0).astype(int)
@@ -349,7 +349,7 @@ def train(
         print('Running paraphrase augmentation on training set...')
         # split first to avoid augmenting validation
         train_df, val_df = train_test_split(df, test_size=val_size, random_state=RANDOM_SEED)
-        train_df_aug, stats = paraphrase_augment_for_labels(train_df, 'Review' if 'Review' in train_df.columns else 'review', LABEL_COLUMNS, paraphrase_model_name, device=device, num_return_sequences=num_return_sequences, min_sim=min_sim, max_sim=max_sim, per_label_multiplier=per_label_multiplier)
+        train_df_aug, stats = paraphrase_augment_for_labels(train_df, 'text' if 'text' in train_df.columns else 'Review', LABEL_COLUMNS, paraphrase_model_name, device=device, num_return_sequences=num_return_sequences, min_sim=min_sim, max_sim=max_sim, per_label_multiplier=per_label_multiplier)
         print('Paraphrase augmentation created', stats)
         df_to_use = pd.concat([train_df_aug, val_df], ignore_index=True)
         # after augmentation, we'll re-split to have validation holdout
@@ -368,8 +368,8 @@ def train(
     y_train = train_df[LABEL_COLUMNS].values.astype(int)
     y_val = val_df[LABEL_COLUMNS].values.astype(int)
 
-    train_dataset = MultiLabelDataset(train_df['Review'].tolist() if 'Review' in train_df.columns else train_df['review'].tolist(), y_train, tokenizer, max_length=max_length)
-    val_dataset = MultiLabelDataset(val_df['Review'].tolist() if 'Review' in val_df.columns else val_df['review'].tolist(), y_val, tokenizer, max_length=max_length)
+    train_dataset = MultiLabelDataset(train_df['text'].tolist() if 'text' in train_df.columns else train_df['Review'].tolist(), y_train, tokenizer, max_length=max_length)
+    val_dataset = MultiLabelDataset(val_df['text'].tolist() if 'text' in val_df.columns else val_df['Review'].tolist(), y_val, tokenizer, max_length=max_length)
 
     # create sampler if requested
     if use_sampler:
@@ -541,7 +541,7 @@ def test(model_or_path, dataloader=None, device: str = None, return_preds: bool 
 def prepare_dataloader_from_df(df: pd.DataFrame, tokenizer_name: str, batch_size: int = 16, max_length: int = 256):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     labels = df[LABEL_COLUMNS].values.astype(int)
-    ds = MultiLabelDataset(df['Review'].tolist(), labels, tokenizer, max_length=max_length)
+    ds = MultiLabelDataset(df['text'].tolist(), labels, tokenizer, max_length=max_length)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
     return loader
 
