@@ -20,6 +20,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, accuracy_score
 from sklearn.linear_model import LogisticRegression
+import joblib
 
 import torch
 import torch.nn as nn
@@ -195,6 +196,33 @@ def evaluate_comp(model, dataloader, device):
     micro, sent_acc, overall = compute_overall_from_preds(all_labels, all_preds)
     return {'micro_f1': micro, 'sentiment_acc': sent_acc, 'overall': overall, 'preds': all_preds, 'labels': all_labels}
 
+def inspect_val_samples(model, dataloader, device, n:int=6):
+    """
+    In ra một vài mẫu validation (raw_text, ground truth, prediction) để inspect nhanh.
+    Yêu cầu dataloader phải trả về 'raw_text' trong batch (là list).
+    """
+    model.eval()
+    seen = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            raw_texts = batch.get('raw_text', None)
+            if raw_texts is None:
+                # can't inspect without raw text
+                break
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].cpu().numpy()
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            preds = np.argmax(out['logits'].cpu().numpy(), axis=-1)
+            for i in range(len(raw_texts)):
+                print("---- SAMPLE ----")
+                print("Text:", raw_texts[i][:400])
+                print("GT   :", {LABEL_COLUMNS[j]: int(labels[i, j]) for j in range(len(LABEL_COLUMNS))})
+                print("Pred :", {LABEL_COLUMNS[j]: int(preds[i, j]) for j in range(len(LABEL_COLUMNS))})
+                seen += 1
+                if seen >= n:
+                    return
+
 # ---------- EMA ----------
 class ModelEMA:
     def __init__(self, model, decay=0.999):
@@ -310,7 +338,8 @@ def finetune_train_loop(df: pd.DataFrame,
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            with torch.amp.autocast('cuda' if device.startswith('cuda') else None):
+            # use enabled flag for autocast (safe for CPU)
+            with torch.cuda.amp.autocast(enabled=device.startswith('cuda')):
                 out = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = out['logits']   # [B,L,K]
                 regs = out['regs']       # [B,L]
@@ -604,7 +633,14 @@ def emb_mlp_pipeline(df: pd.DataFrame, model_name='vinai/phobert-base', out_dir=
     biases, scores, final_preds = tune_bias_on_logits(stacked_logits.copy(), y_val, biases=[-2,-1,-0.5,0,0.5,1,2])
     print("Biases per label:", biases)
     print("After bias tuning -> Micro-F1: %.4f SentAcc: %.4f Overall: %.4f" % scores)
-    # Save ensemble artifacts
+    # Save ensemble artifacts + mlp model states + stackers for prediction step
+    # Save mlp model state_dicts to out_dir so predict script can load them
+    for i, m in enumerate(mlp_models):
+        path = os.path.join(out_dir, f"mlp_model_{i}.pth")
+        torch.save(m.state_dict(), path)
+    # save stackers
+    joblib.dump(stackers, os.path.join(out_dir, 'stackers.pkl'))
+    # save artifacts
     np.savez_compressed(os.path.join(out_dir, 'emb_stack_artifacts.npz'),
                         val_preds=res['val_preds'], val_probs=np.array(res['val_probs'], dtype=object),
                         y_val=y_val)
