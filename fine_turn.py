@@ -447,7 +447,6 @@ def train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden, seed=0, 
         if micro > best_score:
             best_score = micro
             best = model.state_dict()
-            torch.save(best, f'best_mlp.pt')
     model.load_state_dict(best)
     return model, best_score
 
