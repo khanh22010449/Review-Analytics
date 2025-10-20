@@ -411,11 +411,7 @@ class SimpleMLPEnsemble(nn.Module):
         outs = [head(h) for head in self.heads]  # list of [B,K]
         return torch.stack(outs, dim=1)  # [B,L,K]
 
-def train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden, seed=0, epochs=15, bs=256, lr=1e-3, device=None, save_dir=None, model_idx=0):
-    """
-    Train single MLP and save best state to save_dir/mlp_model_{model_idx}.pt (if save_dir provided).
-    Returns: (model_instance_loaded_with_best_weights, best_score, best_state_dict)
-    """
+def train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden, seed=0, epochs=15, bs=256, lr=1e-3, device=None):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     set_seed(seed)
     model = SimpleMLPEnsemble(input_dim, hidden=hidden).to(device)
@@ -425,14 +421,14 @@ def train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden, seed=0, 
     tr = DataLoader(train_ds, batch_size=bs, shuffle=True)
     va = DataLoader(val_ds, batch_size=bs, shuffle=False)
     criterion = nn.CrossEntropyLoss()
-    best_state = None
-    best_score = -1.0
+    best = None
+    best_score = -1
     for ep in range(epochs):
         model.train()
         for xb, yb in tr:
             xb, yb = xb.to(device), yb.to(device)
             logits = model(xb)  # [B,L,K]
-            loss = 0.0
+            loss = 0
             for j in range(len(LABEL_COLUMNS)):
                 loss += criterion(logits[:, j, :], yb[:, j])
             loss = loss / len(LABEL_COLUMNS)
@@ -443,55 +439,40 @@ def train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden, seed=0, 
         with torch.no_grad():
             for xb, yb in va:
                 xb = xb.to(device)
-                out = model(xb).cpu().numpy()  # [B,L,K] logits
+                out = model(xb).cpu().numpy()  # [B,L,K]
                 probs_list.append(out)
         probs = np.vstack(probs_list)
         preds = np.argmax(probs, axis=-1)
         micro = float(f1_score(y_val.flatten(), preds.flatten(), average='micro', zero_division=0))
         if micro > best_score:
             best_score = micro
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
-    # load best into model
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    # Save best_state to disk if save_dir provided
-    if save_dir is not None:
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"mlp_model_{model_idx}.pt")
-        torch.save(best_state, save_path)
-    return model, best_score, best_state
+            best = model.state_dict()
+            torch.save(best, f'best_mlp.pt')
+    model.load_state_dict(best)
+    return model, best_score
 
 def train_ensemble_and_stack(embeddings: np.ndarray, labels: np.ndarray, n_models: int = 3,
                              hidden_sizes: List[int] = [512, 384, 256],
-                             epochs:int=15, batch_size:int=256, lr:float=1e-3, device:Optional[str]=None,
-                             out_dir: Optional[str]=None, model_name: str = 'vinai/phobert-base'):
-    """
-    Train multiple MLPs, save each best model to out_dir/mlp_model_{i}.pt,
-    train per-label stackers (LogisticRegression), save stackers.pkl, and return artifacts.
-    """
+                             epochs:int=15, batch_size:int=256, lr:float=1e-3, device:Optional[str]=None):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     X_train, X_val, y_train, y_val = train_test_split(embeddings, labels, test_size=0.12, random_state=RANDOM_SEED)
     input_dim = X_train.shape[1]
     mlp_models = []
     val_probs = []  # list of [N_val, L, K]
-    saved_state_dicts = []
     for i in tqdm(range(n_models), desc= "Training MLP ensemble"):
         hidden = hidden_sizes[i % len(hidden_sizes)]
-        m, score, best_state = train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden=hidden, seed=RANDOM_SEED + i,
-                                                epochs=epochs, bs=batch_size, lr=lr, device=device,
-                                                save_dir=out_dir, model_idx=i)
+        m, score = train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden=hidden, seed=RANDOM_SEED + i,
+                                    epochs=epochs, bs=batch_size, lr=lr, device=device)
         mlp_models.append(m)
-        saved_state_dicts.append(best_state)
         # get val probs
         m.eval()
         with torch.no_grad():
             out = []
             for idx in range(0, X_val.shape[0], batch_size):
                 xb = torch.from_numpy(X_val[idx:idx+batch_size]).float().to(device)
-                p = m(xb).cpu().numpy()  # [b,L,K] logits
-                # convert to probs
-                ex = np.exp(p - np.max(p, axis=-1, keepdims=True))
-                probs = ex / (ex.sum(axis=-1, keepdims=True) + 1e-12)
+                p = m(xb).cpu().numpy()  # [b,L,K] raw logits
+                probs = np.exp(p - np.max(p, axis=-1, keepdims=True))
+                probs = probs / probs.sum(axis=-1, keepdims=True)
                 out.append(probs)
             out = np.vstack(out)  # [N_val, L, K]
             val_probs.append(out)
@@ -500,35 +481,12 @@ def train_ensemble_and_stack(embeddings: np.ndarray, labels: np.ndarray, n_model
     stackers = []
     for j in range(len(LABEL_COLUMNS)):
         feats = np.concatenate([p[:, j, :] for p in val_probs], axis=1)  # [N_val, K * n_models]
-        lr_stack = LogisticRegression(max_iter=500)
-        lr_stack.fit(feats, y_val[:, j])
-        stackers.append(lr_stack)
-        pred_j = lr_stack.predict(feats)
+        lr = LogisticRegression(max_iter=500)
+        lr.fit(feats, y_val[:, j])
+        stackers.append(lr)
+        pred_j = lr.predict(feats)
         val_preds[:, j] = pred_j
     micro, sent_acc, overall = compute_overall_from_preds(y_val, val_preds)
-    # Save stackers and metadata if out_dir provided
-    if out_dir is not None:
-        os.makedirs(out_dir, exist_ok=True)
-        # save stackers
-        import pickle
-        stackers_path = os.path.join(out_dir, 'stackers.pkl')
-        with open(stackers_path, 'wb') as f:
-            pickle.dump(stackers, f)
-        # save ensemble_meta
-        meta = {
-            'model_name': model_name,
-            'input_dim': int(input_dim),
-            'hidden_sizes': hidden_sizes[:n_models],
-            'n_models': n_models,
-            'timestamp': int(time.time())
-        }
-        meta_path = os.path.join(out_dir, 'ensemble_meta.json')
-        with open(meta_path, 'w') as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-        # also save mlp model files were saved by train_single_mlp
-        # save validation artifacts (val_preds/val_probs/y_val)
-        art_path = os.path.join(out_dir, 'emb_stack_artifacts.npz')
-        np.savez_compressed(art_path, val_preds=val_preds, val_probs=np.array(val_probs, dtype=object), y_val=y_val)
     return {
         'mlp_models': mlp_models,
         'stackers': stackers,
