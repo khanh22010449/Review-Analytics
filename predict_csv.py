@@ -175,35 +175,28 @@ def main():
         model, tokenizer = load_finetune_model(args.model_dir, device)
         print("Tokenizing and predicting ...")
         preds, regs = predict_finetune(model, tokenizer, texts, device, batch_size=args.batch, max_len=args.max_len)
-        # attach to dataframe
         out_df = df.copy()
         for i, lbl in enumerate(LABEL_COLUMNS):
             out_df[f'pred_{lbl}'] = preds[:, i]
             out_df[f'pred_reg_{lbl}'] = regs[:, i]
         out_df.to_csv(args.out_preds, index=False)
         print("Saved predictions to", args.out_preds)
-        # print summary
         print("Prediction distribution:")
         for lbl in LABEL_COLUMNS:
             print(lbl, out_df[f'pred_{lbl}'].value_counts().sort_index().to_dict())
-    else:
-        # emb_mlp mode: attempt to use ensemble artifacts saved by emb pipeline
-        # expected files: model_dir/emb_meanmax.npz (embeddings on training data) and model_dir/emb_stack_artifacts.npz
-        # Also optionally saved mlp models / stackers in model_dir/emb_models.pkl (not created by default)
+    elif args.model_type == 'emb_mlp':
+        import pickle
         emb_path = os.path.join(args.model_dir, 'emb_meanmax.npz')
         artifacts_path = os.path.join(args.model_dir, 'emb_stack_artifacts.npz')
-        
+        mlp_models_path = os.path.join(args.model_dir, 'emb_models.pkl')
+        stackers_path = os.path.join(args.model_dir, 'emb_stackers.pkl')
         if not os.path.exists(artifacts_path):
-            print("[WARNING] emb_mlp artifacts not found: {}".format(artifacts_path))
+            print(f"[WARNING] emb_mlp artifacts not found: {artifacts_path}")
             print("Please run the emb_mlp pipeline and save ensemble artifacts (emb_stack_artifacts.npz) in the model directory.")
             print("Alternatively, use --model-type finetune if you do not have emb_mlp artifacts.")
             return
-        
         print("Computing embeddings for input texts (this may take a few minutes)...")
-        # compute embeddings using model_name from artifacts if present; fallback to vinai/phobert-base
-        # try to use saved tokenizer/model name info from artifacts (not guaranteed)
         model_name = 'vinai/phobert-base'
-        # Build tokenizer and model to compute embeddings
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         encoder = AutoModel.from_pretrained(model_name).to(device).eval()
         B = args.batch
@@ -221,13 +214,56 @@ def main():
                 emb = torch.cat([mean, maxv], dim=1)
                 embs.append(emb.cpu().numpy())
         embs = np.vstack(embs)
-        # load stack artifacts
-        art = np.load(artifacts_path, allow_pickle=True)
-        # artifacts contain val_preds, val_probs, y_val maybe; but not model weights.
-        # This script expects saved ensemble models/stackers (not provided by default). So here we only signal.
-        print("Loaded artifacts:", list(art.files))
-        print("NOTE: emb_mlp inference requires saved MLP model weights & sklearn stackers. If you saved them, extend this script to load them and apply to embeddings.")
-        raise RuntimeError("emb_mlp inference not fully implemented in this predict.py. Please use --model-type finetune or save ensemble artifacts (mlp weights + stackers) for emb_mlp inference.")
+        # Load ensemble models and stackers
+        if not os.path.exists(mlp_models_path) or not os.path.exists(stackers_path):
+            print("[ERROR] emb_mlp requires emb_models.pkl and emb_stackers.pkl saved in model_dir.")
+            print("Please save MLP ensemble models and stackers using the emb_mlp pipeline in fine_turn.py.")
+            return
+        with open(mlp_models_path, 'rb') as f:
+            mlp_models = pickle.load(f)
+        with open(stackers_path, 'rb') as f:
+            stackers = pickle.load(f)
+        # Get logits from each MLP model
+        batch_size = args.batch
+        all_logits = []
+        for m in mlp_models:
+            m.eval()
+            cur = []
+            with torch.no_grad():
+                for idx in range(0, embs.shape[0], batch_size):
+                    xb = torch.from_numpy(embs[idx:idx+batch_size]).float().to(device)
+                    out = m(xb)
+                    cur.append(out.cpu().numpy())
+            cur = np.vstack(cur)
+            all_logits.append(cur)
+        # Convert logits to probabilities
+        all_probs = [np.exp(l - np.max(l, axis=-1, keepdims=True)) / np.sum(np.exp(l - np.max(l, axis=-1, keepdims=True)), axis=-1, keepdims=True) for l in all_logits]
+        # Stacking: for each label, concatenate probs and apply stacker
+        N = embs.shape[0]
+        stacked_logits = np.zeros((N, len(LABEL_COLUMNS), K_CLASSES), dtype=float)
+        for j in range(len(LABEL_COLUMNS)):
+            feats = np.concatenate([p[:, j, :] for p in all_probs], axis=1)
+            lr = stackers[j]
+            if hasattr(lr, 'predict_proba'):
+                proba = lr.predict_proba(feats)
+                # Map proba to logits
+                logits = np.log(proba + 1e-9)
+                stacked_logits[:, j, :proba.shape[1]] = logits
+            else:
+                pred = lr.predict(feats)
+                for i in range(N):
+                    stacked_logits[i, j, pred[i]] = 1.0
+        # Bias tuning (optional, can load biases from artifacts if saved)
+        # Here, just take argmax
+        final_preds = np.argmax(stacked_logits, axis=-1)
+        out_df = df.copy()
+        for i, lbl in enumerate(LABEL_COLUMNS):
+            out_df[f'pred_{lbl}'] = final_preds[:, i]
+        out_df.to_csv(args.out_preds, index=False)
+        print("Saved emb_mlp predictions to", args.out_preds)
+        print("Prediction distribution:")
+        for lbl in LABEL_COLUMNS:
+            print(lbl, out_df[f'pred_{lbl}'].value_counts().sort_index().to_dict())
 
 if __name__ == '__main__':
     main()
