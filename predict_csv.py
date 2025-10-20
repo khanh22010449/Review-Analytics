@@ -192,8 +192,13 @@ def main():
         # Also optionally saved mlp models / stackers in model_dir/emb_models.pkl (not created by default)
         emb_path = os.path.join(args.model_dir, 'emb_meanmax.npz')
         artifacts_path = os.path.join(args.model_dir, 'emb_stack_artifacts.npz')
+        
         if not os.path.exists(artifacts_path):
-            raise FileNotFoundError("emb_mlp artifacts not found. Run emb_mlp pipeline and save ensemble artifacts first.")
+            print("[WARNING] emb_mlp artifacts not found: {}".format(artifacts_path))
+            print("Please run the emb_mlp pipeline and save ensemble artifacts (emb_stack_artifacts.npz) in the model directory.")
+            print("Alternatively, use --model-type finetune if you do not have emb_mlp artifacts.")
+            return
+        
         print("Computing embeddings for input texts (this may take a few minutes)...")
         # compute embeddings using model_name from artifacts if present; fallback to vinai/phobert-base
         # try to use saved tokenizer/model name info from artifacts (not guaranteed)
