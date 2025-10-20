@@ -298,7 +298,7 @@ def finetune_train_loop(df: pd.DataFrame,
     os.makedirs(out_dir, exist_ok=True)
     start_time = time.time()
 
-    for epoch in range(1, epochs + 1):
+    for epoch in tqdm(range(1, epochs + 1), desc="Finetune Epochs"):
         model.train()
         losses = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
@@ -458,7 +458,7 @@ def train_ensemble_and_stack(embeddings: np.ndarray, labels: np.ndarray, n_model
     input_dim = X_train.shape[1]
     mlp_models = []
     val_probs = []  # list of [N_val, L, K]
-    for i in range(n_models):
+    for i in tqdm(range(n_models), desc= "Training MLP ensemble"):
         hidden = hidden_sizes[i % len(hidden_sizes)]
         m, score = train_single_mlp(X_train, y_train, X_val, y_val, input_dim, hidden=hidden, seed=RANDOM_SEED + i,
                                     epochs=epochs, bs=batch_size, lr=lr, device=device)
