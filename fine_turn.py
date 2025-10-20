@@ -561,15 +561,44 @@ def emb_mlp_pipeline(df: pd.DataFrame, model_name='vinai/phobert-base', out_dir=
     # create stacked logits by concatenating probs then mapping via stackers to logits (use decision function)
     stacked_logits = np.zeros((X_val.shape[0], len(LABEL_COLUMNS), K_CLASSES), dtype=float)
     for j in range(len(LABEL_COLUMNS)):
-        feats = np.concatenate([p[:, j, :] for p in all_probs], axis=1)
-        # For each class lr has coef shape (n_features,) and intercept; we can compute "logit-like" scores as decision_function (works for multiclass in sklearn)
+        feats = np.concatenate([p[:, j, :] for p in all_probs], axis=1)  # [N_val, K * n_models]
         lr = stackers[j]
-        try:
-            decision = lr.decision_function(feats)  # shape [N,K]
-        except Exception:
-            # fallback: predict_proba
-            decision = lr.predict_proba(feats)
-        stacked_logits[:, j, :] = decision
+        # Prefer predict_proba (gives probabilities for classes lr.classes_)
+        if hasattr(lr, 'predict_proba'):
+            prob = lr.predict_proba(feats)  # shape (N, n_classes)
+            classes = lr.classes_
+            cur = np.zeros((X_val.shape[0], K_CLASSES), dtype=float)
+            for idx_cls, cls in enumerate(classes):
+                cls_idx = int(cls)
+                if 0 <= cls_idx < K_CLASSES:
+                    cur[:, cls_idx] = prob[:, idx_cls]
+            # convert probabilities to logit-like scores (log prob) for stacking
+            eps = 1e-12
+            cur_logits = np.log(cur + eps)
+            stacked_logits[:, j, :] = cur_logits
+        else:
+            # fallback to decision_function
+            decision = lr.decision_function(feats)
+            if decision.ndim == 1:
+                # binary case -> decision is shape (N,), form two-class scores [-d, d]
+                two = np.vstack([-decision, decision]).T  # shape (N,2)
+                classes = lr.classes_
+                cur = np.zeros((X_val.shape[0], K_CLASSES), dtype=float)
+                for idx_cls, cls in enumerate(classes):
+                    cls_idx = int(cls)
+                    if 0 <= cls_idx < K_CLASSES:
+                        cur[:, cls_idx] = two[:, idx_cls]
+                stacked_logits[:, j, :] = cur
+            else:
+                # multiclass decision_function -> shape (N, n_classes)
+                classes = lr.classes_
+                cur = np.zeros((X_val.shape[0], K_CLASSES), dtype=float)
+                for idx_cls, cls in enumerate(classes):
+                    cls_idx = int(cls)
+                    if 0 <= cls_idx < K_CLASSES:
+                        cur[:, cls_idx] = decision[:, idx_cls]
+                stacked_logits[:, j, :] = cur
+                
     # bias tune
     print("Tuning bias on stacked logits...")
     biases, scores, final_preds = tune_bias_on_logits(stacked_logits.copy(), y_val, biases=[-2,-1,-0.5,0,0.5,1,2])
