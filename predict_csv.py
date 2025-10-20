@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-predict.py
-Inference script supporting two modes:
- - finetune: load MultiTaskModel + tokenizer + best_finetune.pt -> predict
- - emb_mlp: load embeddings + mlp model checkpoints + stackers.pkl -> predict
-Fallbacks and helpful error messages included.
+predict_csv.py - Inference script
+Outputs CSV in structure:
+stt,giai_tri,luu_tru,nha_hang,an_uong,van_chuyen,mua_sam
+1,0,4,4,0,0,0
 """
 import os
 import argparse
@@ -15,20 +14,19 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoTokenizer, AutoModel
 import joblib
-from typing import List
+import glob
 
 # Constants (must match fine_turn)
 LABEL_COLUMNS = ["giai_tri", "luu_tru", "nha_hang", "an_uong", "van_chuyen", "mua_sam"]
 K_CLASSES = 6
 
-# We import model classes from fine_turn.py by relative import if available.
-# If fine_turn.py is in same dir, we can import its classes. Otherwise we re-define minimal wrappers.
+# Try import model definitions from fine_turn if available (optional)
 try:
     from fine_turn import MultiTaskModel, clean_text, SimpleMLPEnsemble
     print("Imported MultiTaskModel and SimpleMLPEnsemble from fine_turn.py")
 except Exception as e:
-    print("Warning: couldn't import classes from fine_turn.py ({}). Trying fallback class defs.".format(e))
-    # Minimal compatible MultiTaskModel stub (only used if import fails)
+    print("Warning: couldn't import classes from fine_turn.py ({}). Using local fallbacks.".format(e))
+    # minimal fallbacks
     from transformers import AutoModel
     import torch.nn as nn
     import torch.nn.functional as F
@@ -102,21 +100,17 @@ def predict_finetune(data_csv, out_csv, model_name, ckpt_path, device='cpu', max
     model = MultiTaskModel(backbone_name=model_name)
     sd = torch.load(ckpt_path, map_location='cpu')
     try:
-        # If saved as full state_dict
         model.load_state_dict(sd)
     except RuntimeError:
-        # maybe saved with module prefix or as 'model' key
         if isinstance(sd, dict) and 'model' in sd:
             model.load_state_dict(sd['model'])
         else:
-            # try filtering keys
             model.load_state_dict({k.replace('module.',''):v for k,v in sd.items()})
     model.to(device); model.eval()
 
     df, texts = load_texts_from_csv(data_csv)
     # tokenization batched
     all_preds = []
-    all_probs = []
     for i in range(0, len(texts), bs):
         batch_text = [t for t in texts[i:i+bs]]
         enc = tokenizer(batch_text, padding=True, truncation=True, max_length=max_len, return_tensors='pt')
@@ -125,28 +119,26 @@ def predict_finetune(data_csv, out_csv, model_name, ckpt_path, device='cpu', max
         with torch.no_grad():
             out = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = out['logits'].cpu().numpy()  # [B,L,K]
-            # probs
-            exp = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
-            probs = exp / (exp.sum(axis=-1, keepdims=True) + 1e-12)
             preds = np.argmax(logits, axis=-1)  # [B,L]
         all_preds.append(preds)
-        all_probs.append(probs)
     if len(all_preds) == 0:
         raise RuntimeError("No data found in CSV or batch size too large.")
-    all_preds = np.vstack(all_preds)
-    all_probs = np.vstack(all_probs)  # [N,L,K]
-
-    # append to df
+    all_preds = np.vstack(all_preds)  # shape [N, L]
+    N = all_preds.shape[0]
+    # build output dataframe with required structure
+    out_df = pd.DataFrame()
+    out_df['stt'] = np.arange(1, N+1, dtype=int)
     for j, lbl in enumerate(LABEL_COLUMNS):
-        df[f'pred_{lbl}'] = all_preds[:, j]
-        # optionally save top-prob for predicted class
-        df[f'pred_{lbl}_prob'] = all_probs[:, j, :].max(axis=-1)
-    df.to_csv(out_csv, index=False)
+        out_df[lbl] = all_preds[:, j].astype(int)
+    # Ensure column order exactly as requested
+    cols = ['stt'] + LABEL_COLUMNS
+    out_df = out_df[cols]
+    out_df.to_csv(out_csv, index=False)
     print("Saved predictions to", out_csv)
     return out_csv
 
-# Embedding utilities (reuse logic from fine_turn)
-def compute_embeddings_from_texts(texts: List[str], model_name: str, device='cpu', batch=128, max_len=128):
+# Embedding utilities (reuse logic)
+def compute_embeddings_from_texts(texts, model_name: str, device='cpu', batch=128, max_len=128):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name).to(device).eval()
     embs = []
@@ -167,7 +159,6 @@ def compute_embeddings_from_texts(texts: List[str], model_name: str, device='cpu
 
 # emb_mlp inference
 def predict_emb_mlp(data_csv, out_csv, model_name, emb_path=None, mlp_dir=None, stacker_pkl=None, device='cpu', batch=256):
-    import glob
     df, texts = load_texts_from_csv(data_csv)
     device = device
     # load or compute embeddings
@@ -205,11 +196,10 @@ def predict_emb_mlp(data_csv, out_csv, model_name, emb_path=None, mlp_dir=None, 
             if os.path.exists(candidate):
                 stackers = joblib.load(candidate); print("Loaded stackers from", candidate); break
 
-    # If we have mlp checkpoints AND stackers -> do full pipeline
     device_t = torch.device(device)
+    # If we have mlp checkpoints AND stackers -> do full pipeline
     if len(mlp_paths) > 0 and stackers is not None:
         print("Full mlp+stacker inference path.")
-        # load mlp models, run them to get probs
         mlp_models = []
         probs_list = []
         for p in mlp_paths:
@@ -222,20 +212,16 @@ def predict_emb_mlp(data_csv, out_csv, model_name, emb_path=None, mlp_dir=None, 
                 if k.endswith('.weight'):
                     w = sd[k]
                     if w.ndim == 2:
-                        # assume shape [out_dim, in_dim]
                         out_dim, in_dim_candidate = w.shape
-                        # choose the first linear layer encountered
                         in_dim = in_dim_candidate
                         hidden = out_dim
                         break
             if in_dim is None or hidden is None:
                 raise RuntimeError(f"Cannot infer MLP dims from state_dict keys for {p}")
-            # construct model matching detected dims
             m = SimpleMLPEnsemble(input_dim=in_dim, hidden=hidden)
             try:
                 m.load_state_dict(sd)
             except Exception as e:
-                # try to strip module. prefixes if present
                 try:
                     sd2 = {k.replace('module.',''):v for k,v in sd.items()}
                     m.load_state_dict(sd2)
@@ -260,23 +246,24 @@ def predict_emb_mlp(data_csv, out_csv, model_name, emb_path=None, mlp_dir=None, 
         for j in range(len(LABEL_COLUMNS)):
             feats = np.concatenate([p[:, j, :] for p in probs_list], axis=1)
             lr = stackers[j]
-            # use predict if available
             if hasattr(lr, 'predict'):
                 pred_j = lr.predict(feats)
             else:
-                # fallback to argmax of mean probs
                 mean_prob = np.mean([p[:, j, :] for p in probs_list], axis=0)
                 pred_j = np.argmax(mean_prob, axis=-1)
-            final_preds[:, j] = pred_j
-        # save to df
+            final_preds[:, j] = np.asarray(pred_j, dtype=int)
+        # build output dataframe with required structure
+        out_df = pd.DataFrame()
+        out_df['stt'] = np.arange(1, N+1, dtype=int)
         for j, lbl in enumerate(LABEL_COLUMNS):
-            df[lbl] = final_preds[:, j]
-        df.to_csv(out_csv, index=False)
+            out_df[lbl] = final_preds[:, j].astype(int)
+        cols = ['stt'] + LABEL_COLUMNS
+        out_df = out_df[cols]
+        out_df.to_csv(out_csv, index=False)
         print("Saved emb_mlp preds to", out_csv)
         return out_csv
 
     # Else fallback: try to use emb_stack_artifacts.npz or val_probs if available
-    # look for emb_stack_artifacts.npz near emb_path or in out dir
     possible_artifact = None
     if emb_path:
         candidate = os.path.join(os.path.dirname(emb_path), 'emb_stack_artifacts.npz')
@@ -292,12 +279,18 @@ def predict_emb_mlp(data_csv, out_csv, model_name, emb_path=None, mlp_dir=None, 
         if 'val_probs' in z:
             try:
                 probs_list = list(z['val_probs'])
+                # probs_list assumed to be list of arrays [N, L, K]
                 stacked = np.stack(probs_list, axis=0)  # [n_models, N, L, K]
                 mean_over_models = np.mean(stacked, axis=0)  # [N,L,K]
-                preds = np.argmax(mean_over_models, axis=-1)
+                preds = np.argmax(mean_over_models, axis=-1)  # [N,L]
+                N = preds.shape[0]
+                out_df = pd.DataFrame()
+                out_df['stt'] = np.arange(1, N+1, dtype=int)
                 for j, lbl in enumerate(LABEL_COLUMNS):
-                    df[f'pred_{lbl}'] = preds[:, j]
-                df.to_csv(out_csv, index=False)
+                    out_df[lbl] = preds[:, j].astype(int)
+                cols = ['stt'] + LABEL_COLUMNS
+                out_df = out_df[cols]
+                out_df.to_csv(out_csv, index=False)
                 print("Saved fallback averaged preds to", out_csv)
                 return out_csv
             except Exception as e:
@@ -306,17 +299,22 @@ def predict_emb_mlp(data_csv, out_csv, model_name, emb_path=None, mlp_dir=None, 
             print("Artifact doesn't contain 'val_probs'. Cannot produce reliable predictions.")
     # Last resort: produce simple baseline (all zeros) and warn
     print("WARNING: Could not find mlp checkpoints or stackers. Producing dummy zero predictions.")
+    N = len(texts)
+    out_df = pd.DataFrame()
+    out_df['stt'] = np.arange(1, N+1, dtype=int)
     for lbl in LABEL_COLUMNS:
-        df[f'pred_{lbl}'] = 0
-    df.to_csv(out_csv, index=False)
+        out_df[lbl] = 0
+    cols = ['stt'] + LABEL_COLUMNS
+    out_df = out_df[cols]
+    out_df.to_csv(out_csv, index=False)
     print("Saved dummy preds to", out_csv)
     return out_csv
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default= "emb_mlp", choices=['finetune','emb_mlp'], required=True)
+    parser.add_argument('--mode', type=str, choices=['finetune','emb_mlp'], required=True)
     parser.add_argument('--data', type=str, default="gt_reviews.csv", help='CSV with texts')
-    parser.add_argument('--out', type=str, default= "./out_emb", help='Output CSV path')
+    parser.add_argument('--out', type=str, default= "preds.csv", help='Output CSV path')
     parser.add_argument('--model', type=str, default='vinai/phobert-base')
     parser.add_argument('--ckpt', type=str, default='./out/best_finetune.pt', help='finetune checkpoint')
     parser.add_argument('--emb_path', type=str, default='./out_emb/emb_meanmax.npz')
