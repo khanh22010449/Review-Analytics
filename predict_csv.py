@@ -270,7 +270,7 @@ def predict_emb_mlp(data_csv, out_csv, model_name, emb_path=None, mlp_dir=None, 
             final_preds[:, j] = pred_j
         # save to df
         for j, lbl in enumerate(LABEL_COLUMNS):
-            df[f'pred_{lbl}'] = final_preds[:, j]
+            df[lbl] = final_preds[:, j]
         df.to_csv(out_csv, index=False)
         print("Saved emb_mlp preds to", out_csv)
         return out_csv
