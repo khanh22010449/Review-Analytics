@@ -62,7 +62,6 @@ class MultiLabelDataLoader(nn.Module):
         self.num_segmments = num_segmments
         self.hidden_size = self.encoder.config.hidden_size
         self.dropout = dropout
-        self.
         self.aspects_classificer = nn.Linear(self.hidden_size, self.num_aspects)
         self.segments_classificer = nn.Linear(self.hidden_size, self.num_segmments + self.num_aspects)
     
@@ -70,5 +69,7 @@ class MultiLabelDataLoader(nn.Module):
         out = self.encoder(**self.tokenizer, return_dict=True)
         pooled = out.pooler_output if hasattr(out, 'pooler_output') and out.pooler_output is not None else out.last_hidden_state[:, 0]
         pooled = self.dropout(pooled)
-        
-        return 
+        aspects_logits = self.aspects_classificer(pooled)
+        segments_logits = self.segments_classificer(pooled)
+
+        return aspects_logits, segments_logits
