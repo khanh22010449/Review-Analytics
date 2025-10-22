@@ -160,7 +160,7 @@ def train_br(train_df, val_df, text_col, aspect_cols, output_dir, random_state=4
         if len(pos_idx) >= 10:
             X_train_pos = X_train[pos_idx]
             y_train_sent = y_train_raw.iloc[pos_idx].astype(int)
-            sentiment_clf = LogisticRegression(max_iter=1500, solver='liblinear', multi_class='auto')
+            sentiment_clf = LogisticRegression(max_iter=1500, solver='saga', multi_class='auto')
             sentiment_clf.fit(X_train_pos, y_train_sent)
             joblib.dump(sentiment_clf, os.path.join(output_dir, f'sentiment_{aspect}.joblib'))
 
