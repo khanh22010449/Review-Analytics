@@ -1,0 +1,45 @@
+Review_segtiment:
+	- Train.py :
+		* def load_data
+		* def Augmentation_data
+		* normalize_data
+		* Class Mutil-label classification
+		* def train
+		* def val
+	- test.py :
+
+Structure of Model: 
+	[Input: train-problem.csv]                    [Input: gt_reviews.csv (test)]
+           |                                            |
+           v                                            v
+[Preprocessing / Column check]                [Preprocessing / Column check]
+ (strip col names, fillna text)                     (ensure 'stt', text)
+           |                                            |
+           v                                            v
+[Train/Val split (train_df / val_df)]                   |
+           |                                            |
+           v                                            v
+[Tokenizer with BPE)]  <---------- same vectorizer fitted on train
+           |
+           v
+[Document vectors: Word2vec]
+           |
+           v
++-----------------------------------------------+
+| For each aspect in ASPECT_COLS:               |
+|  1) Presence classifier (LogisticRegression)  |  <-- Binary Relevance (BR) presence
+|     - target: (rating > 0) ? 1 : 0            |
+|  2) If enough positive samples:               |
+|     Sentiment classifier (LogisticRegression) |  <-- multi-class 1..5 on positives
++-----------------------------------------------+
+           |
+           v
+[Evaluate on val set]
+ - Presence: per-aspect accuracy / F1 (micro/macro)
+ - Sentiment: per-aspect accuracy / MAE (only where GT>0)
+ - Aggregate metrics: micro-F1 (all labels), mean sentiment acc
+           |
+           v
+[Inference on test]
+ - Predict presence -> if presence=1 then predict rating (else 0)
+ - Save `predict.csv` (stt,giai_tri,...)

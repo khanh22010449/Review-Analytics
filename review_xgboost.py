@@ -1,278 +1,441 @@
 #!/usr/bin/env python3
-"""
-improved_review_xgb.py
-Phiên bản dùng XGBoost để cải thiện mean_sent_acc và classification.
-- Dùng XGBoost (XGBClassifier cho presence và sentiment; XGBRegressor làm ordinal fallback)
-- Tiền xử lý TF-IDF giống trước (ngram 1..3, min_df=2)
-- Upsampling balanced cho sentiment
-- Chọn mô hình giữa XGBClassifier và XGBRegressor dựa trên validation accuracy cho mỗi aspect
+# review_xgboost.py  (multi-task BERT training + inference + overall score)
+# Usage:
+# Train: python review_xgboost.py --train train-problem.csv --model_name vinai/phobert-base --output_dir ./mt_model --epochs 3
+# Predict: python review_xgboost.py --predict --model_dir ./mt_model --test_csv gt_reviews.csv --output_csv predict.csv
 
-Chạy:
-python improved_review_xgb.py --train train-problem.csv --test gt_reviews.csv --out_predict predict.csv --out_results results.txt
-
-Yêu cầu:
-pip install xgboost scikit-learn pandas numpy
-"""
-
-import argparse
 import os
+import argparse
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import f1_score, accuracy_score, mean_absolute_error
-from sklearn.utils import resample
-import warnings
-warnings.filterwarnings("ignore")
+import inspect
+from tqdm import tqdm
 
-# XGBoost
-try:
-    import xgboost as xgb
-except Exception as e:
-    raise ImportError("Xin cài đặt xgboost: pip install xgboost")
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
-SEED = 42
-np.random.seed(SEED)
+from transformers import AutoTokenizer, AutoModel, TrainingArguments, Trainer
+from datasets import Dataset
+import evaluate
+from sklearn.metrics import f1_score, accuracy_score
 
+# ---------------------------
 ASPECT_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
-TEXT_COL_TRAIN = "Review"
-TEXT_COL_TEST = "review"
-
+NUM_CLASSES_PER_ASPECT = 6  # 0..5
+# ---------------------------
 
 def safe_read_csv(path):
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
     return df
 
+def prepare_multitask_dataset(df, text_col='Review'):
+    records = []
+    for _, row in df.iterrows():
+        text = row[text_col] if text_col in row.index else ""
+        labels = []
+        for a in ASPECT_COLS:
+            raw = row.get(a, 0)
+            if pd.isna(raw):
+                val = 0
+            else:
+                try:
+                    val = int(raw)
+                except:
+                    val = 0
+            val = max(0, min(5, val))
+            labels.append(val)
+        records.append({'text': str(text), 'labels': labels})
+    ds = Dataset.from_pandas(pd.DataFrame(records))
+    if 'index' in ds.column_names:
+        ds = ds.remove_columns('index')
+    return ds
 
-def upsample_indices(y):
-    classes, counts = np.unique(y, return_counts=True)
-    max_count = counts.max()
-    idxs = np.arange(len(y))
-    resampled = []
-    for cls in classes:
-        cls_idx = idxs[y == cls]
-        res = np.random.choice(cls_idx, size=max_count, replace=True)
-        resampled.append(res)
-    all_idx = np.concatenate(resampled)
-    np.random.shuffle(all_idx)
-    return all_idx
+class MultiAspectModel(nn.Module):
+    def __init__(self, encoder_name, n_aspects=len(ASPECT_COLS), num_classes=NUM_CLASSES_PER_ASPECT, dropout=0.1):
+        super().__init__()
+        # encoder_name may be a model id or a local dir with pretrained encoder weights
+        self.encoder = AutoModel.from_pretrained(encoder_name)
+        hidden_size = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_size, n_aspects * num_classes)
+        self.n_aspects = n_aspects
+        self.num_classes = num_classes
 
-
-def train_and_predict(train_csv, test_csv, out_predict, out_results,
-                      tfidf_max_features=30000):
-    df = safe_read_csv(train_csv)
-    df_test = safe_read_csv(test_csv)
-
-    # ensure text columns
-    if TEXT_COL_TRAIN not in df.columns:
-        if 'review' in df.columns:
-            df[TEXT_COL_TRAIN] = df['review']
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
+        """
+        include 'labels' in signature so Trainer won't drop labels column
+        """
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, return_dict=True)
+        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+            pooled = outputs.pooler_output
         else:
-            raise ValueError(f"Missing text column in train: {TEXT_COL_TRAIN}")
+            last = outputs.last_hidden_state
+            mask = attention_mask.unsqueeze(-1).float()
+            pooled = (last * mask).sum(1) / (mask.sum(1).clamp(min=1e-9))
+        x = self.dropout(pooled)
+        logits = self.classifier(x)
+        logits = logits.view(-1, self.n_aspects, self.num_classes)
+        return logits
 
-    if TEXT_COL_TEST not in df_test.columns:
-        if 'Review' in df_test.columns:
-            df_test[TEXT_COL_TEST] = df_test['Review']
-        elif 'text' in df_test.columns:
-            df_test[TEXT_COL_TEST] = df_test['text']
+# robust metric compute
+accuracy_metric = evaluate.load("accuracy")
+def compute_metrics(eval_pred):
+    """
+    eval_pred: (logits, labels)
+    flatten and compute accuracy; safe if mismatch lengths
+    """
+    logits, labels = eval_pred
+    if logits is None:
+        return {}
+    preds = np.argmax(logits, axis=-1).reshape(-1)
+    refs = np.array(labels).reshape(-1) if labels is not None else None
+
+    if refs is None:
+        return {}
+    if preds.shape[0] != refs.shape[0]:
+        n = min(preds.shape[0], refs.shape[0])
+        print(f"Warning: compute_metrics truncating preds/ref from {preds.shape[0]}/{refs.shape[0]} to {n}.")
+        preds = preds[:n]
+        refs = refs[:n]
+    acc = accuracy_metric.compute(predictions=preds, references=refs)['accuracy']
+    return {"accuracy": acc}
+
+# Robust MTTrainer
+class MTTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # find labels robustly
+        labels = None
+        if "labels" in inputs:
+            labels = inputs.pop("labels")
+        elif "label" in inputs:
+            labels = inputs.pop("label")
+        elif "labels" in kwargs:
+            labels = kwargs.pop("labels")
+        elif "label" in kwargs:
+            labels = kwargs.pop("label")
+
+        if labels is None:
+            # try to locate tensor shaped (batch, n_aspects)
+            for k, v in list(inputs.items()):
+                if isinstance(v, torch.Tensor) and v.dim() == 2 and v.size(1) == len(ASPECT_COLS):
+                    labels = inputs.pop(k)
+                    break
+
+        if labels is None:
+            raise ValueError(
+                "Could not find 'labels' in inputs passed to compute_loss(). "
+                "Ensure your HF Dataset has a 'labels' column (list length == n_aspects) and "
+                "you called dataset.set_format(type='torch', columns=[...,'labels']). "
+                f"Current input keys: {list(inputs.keys())}."
+            )
+
+        if isinstance(labels, np.ndarray):
+            labels = torch.from_numpy(labels)
+
+        labels = labels.to(next(model.parameters()).device)
+
+        logits = model(**inputs)
+        loss_fct = nn.CrossEntropyLoss()
+        total_loss = 0.0
+        for i in range(logits.size(1)):
+            total_loss = total_loss + loss_fct(logits[:, i, :], labels[:, i].long())
+        total_loss = total_loss / logits.size(1)
+        return (total_loss, logits) if return_outputs else total_loss
+
+def make_safe_training_args(args):
+    ta_all = {
+        "output_dir": args.output_dir,
+        "per_device_train_batch_size": args.batch_size,
+        "per_device_eval_batch_size": args.eval_batch_size,
+        "evaluation_strategy": "epoch" if args.eval_steps == 0 else "steps",
+        "eval_steps": args.eval_steps if args.eval_steps > 0 else None,
+        "num_train_epochs": args.epochs,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "save_total_limit": 3,
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_accuracy",
+        "fp16": torch.cuda.is_available(),
+        "logging_dir": os.path.join(args.output_dir, "logs")
+    }
+
+    sig = inspect.signature(TrainingArguments.__init__)
+    valid_params = set(sig.parameters.keys())
+    valid_params.discard('self')
+    ta_filtered = {k: v for k, v in ta_all.items() if k in valid_params}
+    ignored = set(ta_all.keys()) - set(ta_filtered.keys())
+    if ignored:
+        print("Note: the following TrainingArguments keys are unsupported in this environment and will be ignored:", ignored)
+
+    if 'evaluation_strategy' in ta_filtered:
+        eval_strat = ta_filtered.get('evaluation_strategy')
+        if 'save_strategy' in valid_params:
+            ta_filtered['save_strategy'] = eval_strat
+    else:
+        if 'load_best_model_at_end' in ta_filtered and ta_filtered['load_best_model_at_end']:
+            print("Warning: evaluation_strategy unsupported -> setting load_best_model_at_end=False to avoid errors.")
+            ta_filtered['load_best_model_at_end'] = False
+        if 'metric_for_best_model' in ta_filtered:
+            ta_filtered.pop('metric_for_best_model', None)
+
+    return TrainingArguments(**ta_filtered)
+
+def train_main(args):
+    df = safe_read_csv(args.train)
+    text_col = args.text_col if args.text_col in df.columns else ('Review' if 'Review' in df.columns else df.columns[0])
+    print("Using text column:", text_col)
+
+    ds_all = prepare_multitask_dataset(df, text_col=text_col)
+    ds = ds_all.train_test_split(test_size=args.test_size, seed=args.seed)
+    train_ds = ds['train']
+    val_ds = ds['test']
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    model = MultiAspectModel(args.model_name, n_aspects=len(ASPECT_COLS), num_classes=NUM_CLASSES_PER_ASPECT, dropout=args.dropout)
+
+    # Tokenize datasets ahead and return labels so labels persist
+    def tokenize_fn(batch):
+        enc = tokenizer(batch['text'], truncation=True, padding='max_length', max_length=args.max_length)
+        enc['labels'] = batch['labels']
+        return enc
+
+    print("Tokenizing train dataset...")
+    train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=['text'])
+    print("Tokenizing val dataset...")
+    val_ds = val_ds.map(tokenize_fn, batched=True, remove_columns=['text'])
+
+    print("train_ds columns:", train_ds.column_names)
+    print("val_ds columns:", val_ds.column_names)
+
+    columns_to_set = [c for c in ['input_ids', 'attention_mask', 'token_type_ids', 'labels'] if c in train_ds.column_names]
+    train_ds.set_format(type='torch', columns=columns_to_set)
+    val_ds.set_format(type='torch', columns=columns_to_set)
+
+    training_args = make_safe_training_args(args)
+
+    trainer = MTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        compute_metrics=compute_metrics,
+        tokenizer=None
+    )
+
+    trainer.train()
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print("Saved multi-task model to", args.output_dir)
+
+    # Evaluate / save per-aspect predictions on validation set and compute overall score
+    print("Running prediction on validation set...")
+    preds_out = trainer.predict(val_ds)
+    logits = preds_out.predictions  # shape (N_pred, n_aspects, n_classes)
+    label_ids = getattr(preds_out, "label_ids", None)
+
+    if logits is None:
+        raise RuntimeError("trainer.predict returned no predictions (logits is None).")
+
+    pred_labels = np.argmax(logits, axis=-1)  # (N_pred, n_aspects)
+
+    # True labels: prefer label_ids returned by trainer.predict
+    if label_ids is not None:
+        lab = np.array(label_ids)
+        if lab.ndim == 1:
+            if lab.size % len(ASPECT_COLS) == 0:
+                lab = lab.reshape(-1, len(ASPECT_COLS))
+            else:
+                raise RuntimeError("label_ids returned but cannot reshape to (n_examples, n_aspects).")
+        true_labels = lab
+    else:
+        # fallback: build from val_ds
+        true_list = [x['labels'] for x in val_ds]
+        true_labels = np.vstack(true_list) if len(true_list) > 0 else np.zeros((0, len(ASPECT_COLS)), dtype=int)
+
+    # Align pred and true lengths
+    if pred_labels.shape[0] != true_labels.shape[0]:
+        n_pred = pred_labels.shape[0]
+        n_true = true_labels.shape[0]
+        n = min(n_pred, n_true)
+        print(f"Warning: Aligning pred ({n_pred}) and true ({n_true}) to {n} examples.")
+        pred_labels = pred_labels[:n]
+        true_labels = true_labels[:n]
+
+    # Save val preds CSV
+    rows = []
+    for i in range(pred_labels.shape[0]):
+        row = {'idx': int(i)}
+        for j, a in enumerate(ASPECT_COLS):
+            row[f'{a}_gt'] = int(true_labels[i, j])
+            row[f'{a}_pred'] = int(pred_labels[i, j])
+        rows.append(row)
+    out_df = pd.DataFrame(rows)
+    out_csv = os.path.join(args.output_dir, "val_preds.csv")
+    out_df.to_csv(out_csv, index=False, encoding='utf-8')
+    print("Saved validation predictions to", out_csv)
+
+    # --- Compute metrics according to your rules ---
+    # 1) Micro-F1 for presence (presence = label>0)
+    gt_presence = (true_labels > 0).astype(int).reshape(-1)
+    pred_presence = (pred_labels > 0).astype(int).reshape(-1)
+    # avoid zero division: if no positive labels at all, micro f1 set to 0
+    try:
+        micro_f1 = f1_score(gt_presence, pred_presence, average='micro', zero_division=0)
+    except Exception:
+        micro_f1 = 0.0
+
+    # 2) Sentiment accuracy: only positions where GT>0
+    mask = true_labels > 0  # boolean array shape (N, n_aspects)
+    total_positions = int(mask.sum())
+    correct_sent = 0
+    if total_positions > 0:
+        # compare pred_labels to true_labels only where mask True
+        correct_sent = int(((pred_labels == true_labels) & mask).sum())
+        sent_acc = correct_sent / total_positions
+    else:
+        sent_acc = 0.0
+
+    overall_score = 0.7 * micro_f1 + 0.3 * sent_acc
+
+    # Also compute per-aspect presence acc and sentiment acc (for diagnostics)
+    per_aspect = {}
+    for j, a in enumerate(ASPECT_COLS):
+        gt_p = (true_labels[:, j] > 0).astype(int)
+        pred_p = (pred_labels[:, j] > 0).astype(int)
+        pres_f1 = f1_score(gt_p, pred_p, average='micro', zero_division=0)
+        # sentiment acc (only where GT>0)
+        mask_j = gt_p.astype(bool)
+        if mask_j.sum() > 0:
+            sent_acc_j = accuracy_score(true_labels[mask_j, j], pred_labels[mask_j, j])
         else:
-            df_test[TEXT_COL_TEST] = ""
+            sent_acc_j = None
+        per_aspect[a] = {"presence_f1": float(pres_f1), "sent_acc": (None if sent_acc_j is None else float(sent_acc_j)), "n_pos": int(mask_j.sum())}
 
-    if 'stt' not in df_test.columns:
-        df_test.insert(0, 'stt', range(1, len(df_test) + 1))
+    # Save results to results.txt
+    res_path = os.path.join(args.output_dir, "results.txt")
+    with open(res_path, "w", encoding="utf-8") as f:
+        f.write("Validation evaluation results\n")
+        f.write("=================================\n")
+        f.write(f"n_examples (aligned): {pred_labels.shape[0]}\n")
+        f.write(f"Micro-F1 (presence, flattened): {micro_f1:.6f}\n")
+        f.write(f"Sentiment Accuracy (only GT>0 positions): {sent_acc:.6f} (correct {correct_sent}/{total_positions})\n")
+        f.write(f"Overall Score = 0.7 * Micro-F1 + 0.3 * SentimentAcc = {overall_score:.6f}\n\n")
+        f.write("Per-aspect details:\n")
+        for a in ASPECT_COLS:
+            info = per_aspect[a]
+            f.write(f"{a}: presence_f1={info['presence_f1']:.6f}, sent_acc={info['sent_acc']}, n_pos={info['n_pos']}\n")
+        f.write("\nNotes:\n")
+        f.write("- Presence is defined as label>0.\n")
+        f.write("- Sentiment accuracy only counts positions where GT>0, as requested.\n")
+    print(f"Saved results to {res_path}")
+    print(f"Micro-F1 (presence)={micro_f1:.6f}, SentimentAcc={sent_acc:.6f}, Overall={overall_score:.6f}")
 
-    train_df, val_df = train_test_split(df, test_size=0.15, random_state=SEED)
-
-    # TF-IDF
-    vectorizer = TfidfVectorizer(max_features=tfidf_max_features, ngram_range=(1,3), min_df=2)
-    vectorizer.fit(train_df[TEXT_COL_TRAIN].fillna("").astype(str))
-    X_train = vectorizer.transform(train_df[TEXT_COL_TRAIN].fillna("").astype(str))
-    X_val = vectorizer.transform(val_df[TEXT_COL_TRAIN].fillna("").astype(str))
-    X_test = vectorizer.transform(df_test[TEXT_COL_TEST].fillna("").astype(str))
-
-    presence_models = {}
-    sent_models = {}
-    results = {}
-
-    # common XGBoost parameters (can tune)
-    xgb_clf_params = {
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
-        'use_label_encoder': False,
-        'n_estimators': 500,
-        'max_depth': 8,
-        'learning_rate': 0.05,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'random_state': SEED,
-        'verbosity': 0
-    }
-    xgb_multi_params = {
-        'objective': 'multi:softprob',
-        'num_class': 5,
-        'eval_metric': 'mlogloss',
-        'use_label_encoder': False,
-        'n_estimators': 500,
-        'max_depth': 8,
-        'learning_rate': 0.05,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'random_state': SEED,
-        'verbosity': 0
-    }
-    xgb_reg_params = {
-        'objective': 'reg:squarederror',
-        'eval_metric': 'rmse',
-        'n_estimators': 500,
-        'max_depth': 8,
-        'learning_rate': 0.05,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'random_state': SEED,
-        'verbosity': 0
-    }
-
-    for c in ASPECT_COLS:
-        # Presence model (binary)
-        y_train_pres = (train_df[c].fillna(0) > 0).astype(int).values
-        y_val_pres = (val_df[c].fillna(0) > 0).astype(int).values
-
-        clf_pres = xgb.XGBClassifier(**xgb_clf_params)
-        clf_pres.fit(X_train, y_train_pres)
-        presence_models[c] = clf_pres
-
-        val_pred_pres = clf_pres.predict(X_val)
-        results[f"{c}_presence"] = {
-            'acc': float(accuracy_score(y_val_pres, val_pred_pres)),
-            'f1_micro': float(f1_score(y_val_pres, val_pred_pres, average='micro', zero_division=0)),
-            'n_val': int(len(y_val_pres))
-        }
-
-        # Sentiment models
-        train_idx = train_df[train_df[c].fillna(0) > 0].index
-        val_idx = val_df[val_df[c].fillna(0) > 0].index
-
-        if len(train_idx) < 8:
-            sent_models[c] = None
-            results[f"{c}_sent"] = {'acc': None, 'mae': None, 'n_val': int(len(val_idx))}
-            continue
-
-        y_train_sent = train_df.loc[train_idx, c].astype(int).values
-        y_val_sent = val_df.loc[val_idx, c].astype(int).values
-        X_train_sent = X_train[train_df.index.get_indexer(train_idx)]
-        X_val_sent = X_val[val_df.index.get_indexer(val_idx)]
-
-        # Upsample to balance classes
+def load_saved_model(model_dir, device=None):
+    """
+    Load MultiAspectModel from model_dir. Assumes trainer.save_model(model_dir) was called previously,
+    which creates a folder with a pytorch_model.bin. We build model with encoder loaded from model_dir,
+    then load pytorch_model.bin (if present) into model state_dict.
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = MultiAspectModel(model_dir, n_aspects=len(ASPECT_COLS), num_classes=NUM_CLASSES_PER_ASPECT)
+    pt_path = os.path.join(model_dir, "pytorch_model.bin")
+    if os.path.exists(pt_path):
+        state_dict = torch.load(pt_path, map_location=device)
         try:
-            up_idx = upsample_indices(y_train_sent)
-            X_train_sent_bal = X_train_sent[up_idx]
-            y_train_sent_bal = y_train_sent[up_idx]
-        except Exception:
-            X_train_sent_bal = X_train_sent
-            y_train_sent_bal = y_train_sent
+            model.load_state_dict(state_dict)
+        except RuntimeError:
+            new_sd = {}
+            for k, v in state_dict.items():
+                nk = k
+                if k.startswith('model.'):
+                    nk = k[len('model.'):]
+                new_sd[nk] = v
+            model.load_state_dict(new_sd, strict=False)
+    else:
+        print(f"Warning: {pt_path} not found. Using encoder weights from {model_dir} (if available).")
+    model.to(device)
+    model.eval()
+    return model
 
-        # XGBoost multiclass classifier (labels 1..5 -> convert to 0..4)
-        clf_multi = xgb.XGBClassifier(**{**xgb_multi_params, 'num_class': 5})
-        clf_multi.fit(X_train_sent_bal, (y_train_sent_bal - 1))
+def predict_file(model_dir, test_csv, output_csv, text_col_candidates=('review','Review','text'), batch_size=32, max_length=256):
+    """
+    Run inference using saved model at model_dir and tokenizer saved there.
+    Outputs CSV with columns: stt, giai_tri, luu_tru, nha_hang, an_uong, van_chuyen, mua_sam
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    model = load_saved_model(model_dir, device=device)
 
-        # XGBoost regressor (ordinal-aware)
-        reg = xgb.XGBRegressor(**xgb_reg_params)
-        reg.fit(X_train_sent_bal, y_train_sent_bal.astype(float))
+    df = safe_read_csv(test_csv)
+    text_col = None
+    for c in text_col_candidates:
+        if c in df.columns:
+            text_col = c
+            break
+    if text_col is None:
+        obj_cols = [c for c in df.columns if df[c].dtype == 'object']
+        text_col = obj_cols[0] if obj_cols else df.columns[0]
+    if 'stt' not in df.columns:
+        df.insert(0, 'stt', range(1, len(df)+1))
 
-        # Evaluate on val
-        val_pred_clf = clf_multi.predict(X_val_sent) + 1 if len(y_val_sent) > 0 else np.array([])
-        val_pred_reg = np.clip(np.rint(reg.predict(X_val_sent)), 1, 5).astype(int) if len(y_val_sent) > 0 else np.array([])
+    texts = df[text_col].fillna("").astype(str).tolist()
+    n = len(texts)
 
-        acc_clf = accuracy_score(y_val_sent, val_pred_clf) if len(y_val_sent) > 0 else -1
-        acc_reg = accuracy_score(y_val_sent, val_pred_reg) if len(y_val_sent) > 0 else -1
+    all_preds = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, n, batch_size):
+            batch_texts = texts[i:i+batch_size]
+            enc = tokenizer(batch_texts, truncation=True, padding=True, max_length=max_length, return_tensors='pt')
+            enc = {k: v.to(device) for k, v in enc.items()}
+            logits = model(**enc)  # (batch, n_aspects, num_classes)
+            preds = torch.argmax(logits, dim=-1).cpu().numpy()  # shape (b, n_aspects)
+            all_preds.append(preds)
+    if len(all_preds) == 0:
+        preds_arr = np.zeros((0, len(ASPECT_COLS)), dtype=int)
+    else:
+        preds_arr = np.vstack(all_preds)
 
-        # Choose best model (prefer reg when close)
-        if acc_reg + 1e-9 >= acc_clf:
-            sent_models[c] = ('reg', reg)
-            chosen_acc = acc_reg
-            chosen_mae = mean_absolute_error(y_val_sent, val_pred_reg) if len(y_val_sent) > 0 else None
-        else:
-            sent_models[c] = ('clf', clf_multi)
-            chosen_acc = acc_clf
-            chosen_mae = mean_absolute_error(y_val_sent, val_pred_clf) if len(y_val_sent) > 0 else None
+    out_df = pd.DataFrame(preds_arr, columns=ASPECT_COLS)
+    out_df.insert(0, 'stt', df['stt'].astype(int).values[:out_df.shape[0]])
+    out_df.to_csv(output_csv, index=False, encoding='utf-8')
+    print(f"Saved predictions to {output_csv}")
 
-        results[f"{c}_sent"] = {'acc': float(chosen_acc) if chosen_acc is not None else None,
-                                   'mae': float(chosen_mae) if chosen_mae is not None else None,
-                                   'n_val': int(len(y_val_sent))}
+def main(args):
+    if args.predict:
+        if not args.model_dir:
+            raise ValueError("Please provide --model_dir for prediction")
+        predict_file(args.model_dir, args.test_csv, args.output_csv, batch_size=args.pred_batch_size, max_length=args.max_length)
+        return
+    train_main(args)
 
-    # Aggregate multi-label metrics on val
-    val_pres_preds = np.vstack([presence_models[c].predict(X_val) for c in ASPECT_COLS]).T
-    val_pres_tgts = np.vstack([(val_df[c].fillna(0) > 0).astype(int).values for c in ASPECT_COLS]).T
-    micro_f1 = float(f1_score(val_pres_tgts.reshape(-1), val_pres_preds.reshape(-1), average='micro', zero_division=0))
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--train", type=str, default="train-problem.csv")
+    p.add_argument("--model_name", type=str, default="vinai/phobert-base")
+    p.add_argument("--output_dir", type=str, default="./mt_bert_model")
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--eval_batch_size", type=int, default=16)
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--max_length", type=int, default=256)
+    p.add_argument("--test_size", type=float, default=0.15)
+    p.add_argument("--eval_steps", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--text_col", default="Review")
 
-    # Sentiment aggregate
-    sent_accs = []
-    sent_maes = []
-    for c in ASPECT_COLS:
-        m = sent_models.get(c)
-        if m is None:
-            continue
-        mask_idx = val_df[val_df[c].fillna(0) > 0].index
-        if len(mask_idx) == 0:
-            continue
-        X_val_sent = X_val[val_df.index.get_indexer(mask_idx)]
-        y_val_sent = val_df.loc[mask_idx, c].astype(int).values
-        if m[0] == 'clf':
-            y_pred = m[1].predict(X_val_sent) + 1
-        else:
-            y_pred = np.clip(np.rint(m[1].predict(X_val_sent)), 1, 5).astype(int)
-        sent_accs.append(accuracy_score(y_val_sent, y_pred))
-        sent_maes.append(mean_absolute_error(y_val_sent, y_pred))
+    # predict args
+    p.add_argument("--predict", action="store_true", help="Run prediction with saved model")
+    p.add_argument("--model_dir", type=str, default=None, help="Directory containing saved model + tokenizer (for predict)")
+    p.add_argument("--test_csv", type=str, default="gt_reviews.csv", help="CSV to predict")
+    p.add_argument("--output_csv", type=str, default="predict.csv", help="Output CSV path")
+    p.add_argument("--pred_batch_size", type=int, default=32, help="Batch size for prediction")
 
-    mean_sent_acc = float(np.mean(sent_accs)) if len(sent_accs) > 0 else None
-    mean_sent_mae = float(np.mean(sent_maes)) if len(sent_maes) > 0 else None
-
-    # Write results
-    with open(out_results, 'w', encoding='utf-8') as f:
-        f.write('Per-aspect presence:\n')
-        for c in ASPECT_COLS:
-            r = results.get(f"{c}_presence", {})
-            f.write(f"{c}: acc={r.get('acc',0):.4f}, f1_micro={r.get('f1_micro',0):.4f}, n_val={r.get('n_val',0)}\n")
-        f.write('\nPer-aspect sentiment:\n')
-        for c in ASPECT_COLS:
-            r = results.get(f"{c}_sent", {})
-            if r.get('acc') is None:
-                f.write(f"{c}: no sent model (too few samples), val_n={r.get('n_val',0)}\n")
-            else:
-                f.write(f"{c}: acc={r['acc']:.4f}, mae={r['mae']:.4f}, val_n={r['n_val']}\n")
-        f.write('\nAggregates:\n')
-        f.write(f"micro_f1_presence: {micro_f1:.4f}\n")
-        f.write(f"mean_sent_acc: {mean_sent_acc}\n")
-        f.write(f"mean_sent_mae: {mean_sent_mae}\n")
-
-    # Predict on test
-    final_pred = pd.DataFrame()
-    final_pred['stt'] = df_test['stt'].astype(int)
-    for c in ASPECT_COLS:
-        pres = presence_models[c].predict(X_test)
-        if sent_models.get(c) is None:
-            pred_rating_masked = np.zeros(X_test.shape[0], dtype=int)
-        else:
-            m = sent_models[c]
-            if m[0] == 'clf':
-                pred_all = m[1].predict(X_test) + 1
-            else:
-                pred_all = np.clip(np.rint(m[1].predict(X_test)), 1, 5).astype(int)
-            pred_rating_masked = np.where(pres == 1, pred_all, 0)
-        final_pred[c] = pred_rating_masked.astype(int)
-
-    final_pred.to_csv(out_predict, index=False, encoding='utf-8')
-    print(f"Saved predict: {out_predict}")
-    print(f"Saved results: {out_results}")
-    return out_predict, out_results
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--train', default='train-problem.csv')
-    parser.add_argument('--test', default='gt_reviews.csv')
-    parser.add_argument('--out_predict', default='predict.csv')
-    parser.add_argument('--out_results', default='results.txt')
-    args = parser.parse_args()
-    train_and_predict(args.train, args.test, args.out_predict, args.out_results)
+    args = p.parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    main(args)
