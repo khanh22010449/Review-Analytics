@@ -144,7 +144,7 @@ def train_br(train_df, val_df, text_col, aspect_cols, output_dir, random_state=4
         y_train_pres = (y_train_raw > 0).astype(int)
         y_val_pres = (y_val_raw > 0).astype(int)
 
-        pres_clf = LogisticRegression(max_iter=1000, solver='liblinear')
+        pres_clf = LogisticRegression(max_iter=1000, solver='lbfgs')
         pres_clf.fit(X_train, y_train_pres)
         joblib.dump(pres_clf, os.path.join(output_dir, f'presence_{aspect}.joblib'))
 
