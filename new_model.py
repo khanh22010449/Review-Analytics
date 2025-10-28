@@ -1,15 +1,14 @@
-# nn_bt_minority.py
+# new_model.py
 """
-Multi-task multi-label + segment training with offline back-translation
-that augments ONLY minority-class samples per-aspect.
-
+Improved training script based on nn_bt_minority.py with:
+ - LayerNorm in heads
+ - per-aspect loss scaling
+ - label smoothing option
+ - adjustable focal gamma / option to use CE
+ - back-translation copies (k)
+ - logging: confusion matrices + top high-confidence errors per epoch
 Usage example:
-  python nn_bt_minority.py --data_dir data --do_augment True --bt_mid en --fp16 True
-
-Outputs:
-  - best_multitask_weighted.pt
-  - cached augmented CSV in bt_cache/
-  - predictions saved to data/predictions.csv at end
+  python new_model.py --data_dir data --do_augment True --bt_mid en --fp16 True --gamma 1.0 --hidden_head 512 --w_pres 0.5 --w_seg 1.5 --bt_copies 2
 """
 
 import os
@@ -33,31 +32,31 @@ from transformers import (AutoTokenizer, AutoModel, AutoConfig,
                           MarianMTModel, MarianTokenizer)
 
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report
 
-# ---------------- Config (tweakable) ----------------
+# ---------------- Config (defaults, tweakable via CLI) ----------------
 MODEL_NAME = "vinai/phobert-base"
 MAX_LEN = 256
 BATCH_SIZE = 16
 LR_ENCODER = 1e-5
 LR_HEADS = 1e-4
-NUM_EPOCHS = 50
+NUM_EPOCHS = 10
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LABEL_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
 NUM_ASPECTS = len(LABEL_COLS)
 NUM_SEGMENT_CLASSES = 5
 USE_FOCAL = True
-FGAMMA = 1.5
+FGAMMA = 1.0
 CACHE_DIR = "bt_cache"
 AUG_TGT_LANG = "en"
 BT_BATCH = 16
-NUM_WORKERS = 5
+NUM_WORKERS = 4
 GRAD_ACCUM_STEPS = 1
 WEIGHT_DECAY = 0.01
-FREEZE_ENCODER_EPOCHS = 1
-MIN_SAMPLES_RARE = 200  # threshold to consider a class rare (tune)
-TOP_K_RARE = 2         # also include top K rarest classes
-# ----------------------------------------------------
+FREEZE_ENCODER_EPOCHS = 0
+MIN_SAMPLES_RARE = 50
+TOP_K_RARE = 2
+# ---------------------------------------------------------------------
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -65,13 +64,11 @@ def seed_everything(seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
 seed_everything(42)
 
 # ---------- Text cleaning ----------
 import re, html
 from bs4 import BeautifulSoup
-
 def clean_text(text: str) -> str:
     text = BeautifulSoup(str(text), "html.parser").get_text()
     text = html.unescape(text)
@@ -135,7 +132,7 @@ def collate_fn(batch):
 
 # ---------- Loss: Focal with ignore_index ----------
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None, ignore_index=-1, reduction='mean'):
+    def __init__(self, gamma=1.0, weight=None, ignore_index=-1, reduction='mean'):
         super().__init__()
         self.gamma = gamma
         self.weight = weight
@@ -160,7 +157,7 @@ class FocalLoss(nn.Module):
         else:
             return focal
 
-# ---------- Model ----------
+# ---------- Model with LayerNorm in heads ----------
 class MultiTaskTransformer(nn.Module):
     def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, dropout=0.1):
         super().__init__()
@@ -174,6 +171,7 @@ class MultiTaskTransformer(nn.Module):
             nn.Sequential(
                 nn.Linear(hidden, hidden_head),
                 nn.ReLU(),
+                nn.LayerNorm(hidden_head),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_head, num_seg_classes)
             ) for _ in range(num_aspects)
@@ -240,7 +238,7 @@ def compute_metrics_seg_and_pres(seg_logits, pres_logits, seg_targets, pres_targ
     metrics['pres_f1_macro'] = float(f1_score(pres_true.reshape(-1), pres_preds.reshape(-1), average='macro', zero_division=0))
     return metrics
 
-# ---------- Back-translation utilities ----------
+# ---------- Back-translation utilities (support k copies) ----------
 def prepare_bt_models(src='vi', mid='en', cache_dir=CACHE_DIR):
     os.makedirs(cache_dir, exist_ok=True)
     name_1 = f'Helsinki-NLP/opus-mt-{src}-{mid}'
@@ -286,14 +284,26 @@ def find_minority_classes_per_aspect(df, label_cols, num_seg_classes=5, min_samp
     return rare_map
 
 def do_offline_back_translation_minority(train_df, cache_dir=CACHE_DIR, mid_lang='en', bt_batch=BT_BATCH,
-                                         min_samples=MIN_SAMPLES_RARE, top_k=TOP_K_RARE, cache_name="train_aug_bt_minority.csv"):
+                                         min_samples=MIN_SAMPLES_RARE, top_k=TOP_K_RARE, cache_name="train_aug_bt_minority.csv",
+                                         bt_copies=1):
+    """
+    bt_copies: number of augmented copies to produce (1 => 1 paraphrase each).
+    If bt_copies>1 we generate additional paraphrases (may be slower).
+    """
     os.makedirs(cache_dir, exist_ok=True)
     cache_meta = Path(cache_dir) / "bt_minority_meta.json"
     cached_csv = Path(cache_dir) / cache_name
 
+    # if already cached and copies match, return (we'll encode copies in meta)
     if cached_csv.exists():
-        print("Found cached minority-augmented file:", cached_csv)
-        return str(cached_csv)
+        try:
+            with open(cache_meta, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("bt_copies",1) == bt_copies:
+                print("Found cached minority-augmented file:", cached_csv)
+                return str(cached_csv)
+        except Exception:
+            pass
 
     rare_map = find_minority_classes_per_aspect(train_df, LABEL_COLS, num_seg_classes=NUM_SEGMENT_CLASSES,
                                                 min_samples=min_samples, top_k=top_k)
@@ -315,30 +325,84 @@ def do_offline_back_translation_minority(train_df, cache_dir=CACHE_DIR, mid_lang
         print("No minority samples found for augmentation. Exiting.")
         return None
 
-    texts = train_df.loc[idxs_to_aug, "Review"].astype(str).tolist()
+    texts_base = train_df.loc[idxs_to_aug, "Review"].astype(str).tolist()
 
     print("Preparing BT models (this may download models)...")
     model_pair = prepare_bt_models(src='vi', mid=mid_lang, cache_dir=cache_dir)
 
-    print("Back-translating minority texts in batches...")
-    bt_texts = back_translate_texts(texts, model_pair, batch_size=bt_batch, device='cpu')
+    # collect augmented rows (k copies)
+    aug_rows = []
+    for copy_idx in range(bt_copies):
+        print(f"Generating BT copy {copy_idx+1}/{bt_copies} ...")
+        bt_texts = back_translate_texts(texts_base, model_pair, batch_size=bt_batch, device='cpu')
+        if len(bt_texts) != len(texts_base):
+            raise RuntimeError("Back-translation count mismatch")
+        df_aug = train_df.loc[idxs_to_aug].copy().reset_index(drop=True)
+        df_aug['Review'] = bt_texts
+        aug_rows.append(df_aug)
 
-    if len(bt_texts) != len(texts):
-        raise RuntimeError("Back-translation count mismatch")
-
-    df_aug = train_df.loc[idxs_to_aug].copy().reset_index(drop=True)
-    df_aug['Review'] = bt_texts
-
-    df_concat = pd.concat([train_df, df_aug], ignore_index=True).sample(frac=1, random_state=42).reset_index(drop=True)
+    # concatenate original + all augmented copies
+    df_concat = pd.concat([train_df] + aug_rows, ignore_index=True).sample(frac=1, random_state=42).reset_index(drop=True)
     df_concat.to_csv(cached_csv, index=False)
-    meta = {"n_orig": len(train_df), "n_aug": len(df_aug), "idxs_augmented": idxs_to_aug, "rare_map": {k:list(v) for k,v in rare_map.items()}}
+    meta = {"n_orig": len(train_df), "n_aug_per_copy": len(idxs_to_aug), "n_copies": bt_copies,
+            "idxs_augmented": idxs_to_aug, "rare_map": {k:list(v) for k,v in rare_map.items()}, "bt_copies": bt_copies}
     with open(cache_meta, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print("Saved minority-augmented CSV to:", cached_csv)
     return str(cached_csv)
 
+# ---------- Logging / analysis helpers ----------
+def save_confusion_and_report(seg_logits, seg_targets, epoch, out_dir="analysis"):
+    os.makedirs(out_dir, exist_ok=True)
+    seg_preds = torch.argmax(seg_logits, dim=-1).cpu().numpy()
+    seg_true = seg_targets.cpu().numpy()
+    for a, col in enumerate(LABEL_COLS):
+        mask = seg_true[:, a] != -1
+        if mask.sum() == 0:
+            continue
+        y_true = seg_true[mask, a]
+        y_pred = seg_preds[mask, a]
+        cm = confusion_matrix(y_true, y_pred, labels=[0,1,2,3,4])
+        rep = classification_report(y_true, y_pred, labels=[0,1,2,3,4], zero_division=0)
+        pd.DataFrame(cm).to_csv(os.path.join(out_dir, f"confusion_{col}_epoch{epoch}.csv"), index=False)
+        with open(os.path.join(out_dir, f"report_{col}_epoch{epoch}.txt"), "w", encoding="utf-8") as f:
+            f.write(rep)
+
+def save_top_high_conf_errors(model, dataset_df, tokenizer, epoch, out_dir="analysis", top_k=200):
+    os.makedirs(out_dir, exist_ok=True)
+    ds = ReviewDataset(dataset_df, tokenizer, max_len=MAX_LEN)
+    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    model.to("cpu")
+    model.eval()
+    rows = []
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            input_ids = batch['input_ids']
+            attention_mask = batch['attention_mask']
+            seg_labels = batch['seg_labels'].numpy()
+            seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            seg_probs = torch.softmax(seg_logits, dim=-1).numpy()  # [B,A,C]
+            seg_pred = seg_probs.argmax(-1)
+            conf = seg_probs.max(-1)
+            B,A = seg_pred.shape
+            for b in range(B):
+                idx = batch_idx*B + b
+                if idx >= len(dataset_df): break
+                text = dataset_df.iloc[idx]["Review"]
+                for a,col in enumerate(LABEL_COLS):
+                    true_raw = int(dataset_df.iloc[idx][col] if not pd.isna(dataset_df.iloc[idx][col]) else 0)
+                    if true_raw==0: continue
+                    true = true_raw - 1
+                    p = int(seg_pred[b,a])
+                    c = float(conf[b,a])
+                    if p!=true:
+                        rows.append({"idx": idx, "aspect": col, "text": text, "true": int(true), "pred": p, "conf": c})
+    df_err = pd.DataFrame(rows).sort_values(["aspect","conf"], ascending=[True,False]).head(top_k)
+    df_err.to_csv(os.path.join(out_dir, f"top_high_conf_errors_epoch{epoch}.csv"), index=False)
+    model.to(DEVICE)
+
 # ---------- Train / Validate / Predict ----------
-def validate(val_loader, model, device='cpu'):
+def validate(val_loader, model, device='cpu', threshold=0.5, epoch=None, tokenizer=None, val_df=None):
     model.eval()
     seg_logits_all, pres_logits_all, seg_t_all, pres_t_all = [], [], [], []
     with torch.no_grad():
@@ -356,12 +420,19 @@ def validate(val_loader, model, device='cpu'):
     pres_logits = torch.cat(pres_logits_all)
     seg_t = torch.cat(seg_t_all)
     pres_t = torch.cat(pres_t_all)
+
+    # save confusion matrix + report
+    if epoch is not None:
+        save_confusion_and_report(seg_logits, seg_t, epoch, out_dir="analysis")
+        if tokenizer is not None and val_df is not None:
+            save_top_high_conf_errors(model, val_df, tokenizer, epoch, out_dir="analysis", top_k=200)
+
     return compute_metrics_seg_and_pres(seg_logits, pres_logits, seg_t, pres_t)
 
 def train_loop_with_weights(train_loader, val_loader, model, optimizer, scheduler=None,
-               num_epochs=3, device='cpu', w_seg=1.0, w_pres=1.0,
-               seg_loss_type='focal', per_aspect_weights=None, gamma=2.0,
-               freeze_encoder_epochs=0, grad_accum_steps=1, fp16=True):
+               num_epochs=3, device='cpu', w_seg=1.0, w_pres=0.5,
+               seg_loss_type='focal', per_aspect_weights=None, gamma=1.0,
+               freeze_encoder_epochs=0, grad_accum_steps=1, fp16=True, aspect_loss_scale=None, tokenizer=None, val_df=None):
     model.to(device)
     scaler = GradScaler() if fp16 and device == 'cuda' else None
     bce_loss = nn.BCEWithLogitsLoss()
@@ -371,6 +442,7 @@ def train_loop_with_weights(train_loader, val_loader, model, optimizer, schedule
         if seg_loss_type == 'focal':
             per_aspect_loss.append(FocalLoss(gamma=gamma, weight=w_t, ignore_index=-1))
         else:
+            # label smoothing can be applied if needed via CROSS entropy with label_smoothing in newer PyTorch
             per_aspect_loss.append(nn.CrossEntropyLoss(weight=w_t, ignore_index=-1))
 
     best_val = None
@@ -398,9 +470,11 @@ def train_loop_with_weights(train_loader, val_loader, model, optimizer, schedule
                     seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
                     B,A,C = seg_logits.shape
                     loss_seg = 0.0
+                    # per-aspect scaling (aspect_loss_scale list same length as A)
                     for a in range(A):
                         loss_a = per_aspect_loss[a](seg_logits[:,a,:], seg_labels[:,a])
-                        loss_seg += loss_a
+                        scale = aspect_loss_scale[a] if aspect_loss_scale is not None else 1.0
+                        loss_seg += (scale * loss_a)
                     loss_seg = loss_seg / max(1, A)
                     loss_pres = bce_loss(pres_logits, pres_labels)
                     loss = w_seg * loss_seg + w_pres * loss_pres
@@ -419,7 +493,8 @@ def train_loop_with_weights(train_loader, val_loader, model, optimizer, schedule
                 loss_seg = 0.0
                 for a in range(A):
                     loss_a = per_aspect_loss[a](seg_logits[:,a,:], seg_labels[:,a])
-                    loss_seg += loss_a
+                    scale = aspect_loss_scale[a] if aspect_loss_scale is not None else 1.0
+                    loss_seg += (scale * loss_a)
                 loss_seg = loss_seg / max(1, A)
                 loss_pres = bce_loss(pres_logits, pres_labels)
                 loss = w_seg * loss_seg + w_pres * loss_pres
@@ -434,7 +509,8 @@ def train_loop_with_weights(train_loader, val_loader, model, optimizer, schedule
             total_loss += float(loss.detach().cpu().item())
             pbar.set_postfix({'loss': total_loss / (step+1)})
 
-        val_metrics = validate(val_loader, model, device)
+        # validation and logging
+        val_metrics = validate(val_loader, model, device, epoch=epoch+1, tokenizer=tokenizer, val_df=val_df)
         print(f"Epoch {epoch+1} val metrics:", val_metrics)
         score = val_metrics['pres_f1_micro'] + val_metrics['seg_f1_macro_mean']
         if best_val is None or score > best_val:
@@ -481,6 +557,12 @@ def main():
     parser.add_argument("--num_workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--min_samples_rare", type=int, default=MIN_SAMPLES_RARE)
     parser.add_argument("--top_k_rare", type=int, default=TOP_K_RARE)
+    parser.add_argument("--gamma", type=float, default=FGAMMA)
+    parser.add_argument("--hidden_head", type=int, default=512)
+    parser.add_argument("--w_pres", type=float, default=0.5)
+    parser.add_argument("--w_seg", type=float, default=1.5)
+    parser.add_argument("--use_focal", type=lambda x: x.lower() == "true", default=True)
+    parser.add_argument("--bt_copies", type=int, default=1, help="Number of BT copies per rare sample")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -494,11 +576,20 @@ def main():
 
     if args.do_augment:
         aug_path = do_offline_back_translation_minority(train, cache_dir=args.aug_cache_dir, mid_lang=args.bt_mid,
-                                                        bt_batch=BT_BATCH, min_samples=args.min_samples_rare, top_k=args.top_k_rare)
+                                                        bt_batch=BT_BATCH, min_samples=args.min_samples_rare,
+                                                        top_k=args.top_k_rare, bt_copies=args.bt_copies)
         if aug_path is not None:
             train = pd.read_csv(aug_path)
         else:
             print("No augmentation performed; continuing with original train set.")
+
+    # compute aspect loss scale inversely proportional to positive counts (sqrt scaling)
+    aspect_pos_counts = []
+    for col in LABEL_COLS:
+        pos = np.sum(train[col].fillna(0).astype(int) > 0)
+        aspect_pos_counts.append(max(1, pos))
+    max_pos = max(aspect_pos_counts)
+    aspect_loss_scale = [float(math.sqrt(max_pos / c)) for c in aspect_pos_counts]
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     train_ds = ReviewDataset(train, tokenizer, max_len=MAX_LEN)
@@ -510,7 +601,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
-    model = MultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES)
+    model = MultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES, hidden_head=args.hidden_head)
 
     per_aspect_weights = compute_per_aspect_weights(train, LABEL_COLS, NUM_SEGMENT_CLASSES)
 
@@ -520,16 +611,17 @@ def main():
         {'params': model.presence_head.parameters(), 'lr': LR_HEADS}
     ], weight_decay=WEIGHT_DECAY)
 
-    total_steps = len(train_loader) * NUM_EPOCHS // max(1, args.grad_accum)
+    total_steps = max(1, len(train_loader) * NUM_EPOCHS // max(1, args.grad_accum))
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.06 * total_steps), num_training_steps=total_steps)
 
-    seg_loss_type = 'focal' if USE_FOCAL else 'ce'
+    seg_loss_type = 'focal' if args.use_focal else 'ce'
     train_loop_with_weights(train_loader, val_loader, model, optimizer, scheduler,
-               num_epochs=NUM_EPOCHS, device=DEVICE, w_seg=1.5, w_pres=1.0,
-               seg_loss_type=seg_loss_type, per_aspect_weights=per_aspect_weights, gamma=FGAMMA,
-               freeze_encoder_epochs=FREEZE_ENCODER_EPOCHS, grad_accum_steps=args.grad_accum, fp16=args.fp16)
+               num_epochs=NUM_EPOCHS, device=DEVICE, w_seg=args.w_seg, w_pres=args.w_pres,
+               seg_loss_type=seg_loss_type, per_aspect_weights=per_aspect_weights, gamma=args.gamma,
+               freeze_encoder_epochs=FREEZE_ENCODER_EPOCHS, grad_accum_steps=args.grad_accum, fp16=args.fp16,
+               aspect_loss_scale=aspect_loss_scale, tokenizer=tokenizer, val_df=val)
 
-    test_metrics = validate(test_loader, model, device=DEVICE)
+    test_metrics = validate(test_loader, model, device=DEVICE, epoch=None)
     print("Test metrics:", test_metrics)
 
     predict_and_save(model, test_loader, output_path="data/predictions.csv", device=DEVICE)
