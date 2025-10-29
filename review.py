@@ -12,6 +12,8 @@ from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error
 import joblib
 from tqdm import tqdm
 
+from processing_data import clean_text_single
+
 # Optional W2V
 USE_W2V = True
 try:
@@ -38,6 +40,7 @@ def preprocess_df(df, text_col_candidate=None, use_pyvi=False):
     Trả về (df, text_col). Nếu use_pyvi=True và pyvi có sẵn thì sẽ tokenize cột text (ghi đè vào cột text).
     """
     df = df.copy()
+    df['Review'] = df.iloc[:, 0].map(clean_text_single)
     df.columns = [c.strip() for c in df.columns]
     if text_col_candidate and text_col_candidate in df.columns:
         text_col = text_col_candidate
