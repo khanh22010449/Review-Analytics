@@ -251,13 +251,85 @@ def self_training_pipeline(args):
     # optionally pre-load a model for inference if user gives model_path
     model_for_infer = None
     if args.model_path:
-        if Path(args.model_path).exists():
-            print("Loading model checkpoint for inference from", args.model_path)
-            model_for_infer = SimpleMultiTask(MODEL_NAME, NUM_ASPECTS, NUM_SEG_CLASSES)
-            state = torch.load(args.model_path, map_location="cpu")
-            model_for_infer.load_state_dict(state)
-            model_for_infer.to(device)
-            model_for_infer.eval()
+        ckpt_path = Path(args.model_path)
+        if ckpt_path.exists():
+            print("Attempting to load checkpoint for inference from", ckpt_path)
+            state = torch.load(str(ckpt_path), map_location="cpu")
+            # state may be a dict with extra keys (like 'state_dict'), handle common cases
+            if isinstance(state, dict) and 'state_dict' in state and isinstance(state['state_dict'], dict):
+                state = state['state_dict']
+
+            # try to load exactly into default model first
+            try:
+                tmp_model = SimpleMultiTask(MODEL_NAME, NUM_ASPECTS, NUM_SEG_CLASSES)
+                tmp_model.load_state_dict(state)  # strict True
+                model_for_infer = tmp_model
+                print("Loaded checkpoint EXACTLY into model (strict=True).")
+            except Exception as e1:
+                print("Strict load failed:", e1)
+                # try to infer hidden_head from checkpoint if possible
+                inferred_hidden = None
+                for k,v in state.items():
+                    if k.startswith("segment_heads.0.0.weight"):
+                        # shape [hidden_head, hidden_size]
+                        inferred_hidden = v.shape[0]
+                        print("Inferred hidden_head from key", k, "=", inferred_hidden)
+                        break
+                if inferred_hidden is None:
+                    # search for any segment_heads.*.*.weight shape that suggests hidden
+                    for k,v in state.items():
+                        if k.startswith("segment_heads.") and k.endswith(".weight"):
+                            # v is tensor
+                            if v.dim() == 2:
+                                inferred_hidden = v.shape[0]
+                                print("Inferred hidden_head (fallback) from key", k, "=", inferred_hidden)
+                                break
+
+                if inferred_hidden is not None:
+                    # recreate model with inferred hidden and try non-strict load
+                    try:
+                        print(f"Recreating model with hidden_head={inferred_hidden} and attempting non-strict load.")
+                        tmp_model = SimpleMultiTask(MODEL_NAME, NUM_ASPECTS, NUM_SEG_CLASSES, hidden_head=int(inferred_hidden))
+                        # load non-strict to accept minor key mismatches
+                        load_res = tmp_model.load_state_dict(state, strict=False)
+                        print("Non-strict load result:", load_res)
+                        model_for_infer = tmp_model
+                    except Exception as e2:
+                        print("Non-strict load with inferred hidden failed:", e2)
+                        model_for_infer = None
+                else:
+                    print("Could not infer head hidden size from checkpoint; will try to load encoder-only.")
+
+                # final fallback: load encoder weights only
+                if model_for_infer is None:
+                    try:
+                        print("Falling back to loading encoder weights only into default model.")
+                        tmp_model = SimpleMultiTask(MODEL_NAME, NUM_ASPECTS, NUM_SEG_CLASSES)
+                        model_state = tmp_model.state_dict()
+                        # filter encoder.* keys from checkpoint
+                        encoder_state = {k.replace("encoder.", ""): v for k,v in state.items() if k.startswith("encoder.")}
+                        # If checkpoint keys include module prefix or different naming, attempt flexible matching
+                        # Try matching checkpoint encoder.* -> tmp_model.encoder.state_dict() keys
+                        enc_sd = tmp_model.encoder.state_dict()
+                        matched = {}
+                        for ck_k, ck_v in state.items():
+                            if ck_k.startswith("encoder."):
+                                target_k = ck_k[len("encoder."):]
+                                if target_k in enc_sd and enc_sd[target_k].shape == ck_v.shape:
+                                    matched[target_k] = ck_v
+                        tmp_model.encoder.load_state_dict(matched, strict=False)
+                        print(f"Loaded {len(matched)} encoder params into model.encoder (non-strict).")
+                        model_for_infer = tmp_model
+                    except Exception as e3:
+                        print("Encoder-only load failed:", e3)
+                        model_for_infer = None
+            # finalize
+            if model_for_infer is not None:
+                model_for_infer.to(device)
+                model_for_infer.eval()
+                print("Model for inference ready.")
+            else:
+                print("Warning: Could not load checkpoint for inference. Will use freshly trained model for inference.")
         else:
             print("Warning: model_path provided but file not found:", args.model_path)
             model_for_infer = None
