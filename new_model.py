@@ -66,12 +66,26 @@ def drop_all_zero_samples(df: pd.DataFrame, label_cols: List[str]) -> pd.DataFra
     return df_clean
 
 def map_labels_1to5_to_0to4(df: pd.DataFrame, label_cols: List[str]) -> pd.DataFrame:
-    """Chuyển 1..5 -> 0..4; giữ NaN cho 0/missing"""
+    """
+    An toàn chuyển nhãn 1..5 -> 0..4. 
+    - Thay 0 (không đề cập) bằng NaN
+    - Dùng pd.to_numeric(..., errors='coerce') để convert an toàn
+    - Giữ NaN cho missing
+    """
     df2 = df.copy()
     for c in label_cols:
-        df2[c] = df2[c].replace({0: pd.NA})
-        df2[c] = df2[c].astype('float')  # allow NaN
-        df2.loc[df2[c].notna(), c] = df2.loc[df2[c].notna(), c].astype(int) - 1
+        # 1) Thay 0 (ý bạn muốn bỏ) bằng NaN
+        df2[c] = df2[c].replace(0, np.nan)
+        # 2) Chuyển sang số (float) an toàn — các giá trị không convert được thành NaN
+        df2[c] = pd.to_numeric(df2[c], errors='coerce')
+        # 3) Map 1..5 -> 0..4, chỉ với những ô không NaN
+        mask = df2[c].notna()
+        if mask.any():
+            # convert to int safely then subtract 1
+            df2.loc[mask, c] = df2.loc[mask, c].astype(int) - 1
+        # 4) đảm bảo dtype float (vì còn NaN) hoặc int where possible
+        # keep as float to allow NaN
+        df2[c] = df2[c].astype('float')
     return df2
 
 # ----------------------------
