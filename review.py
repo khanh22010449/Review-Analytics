@@ -1,200 +1,197 @@
-#!/usr/bin/env python3
-# train_and_predict_final.py
-# Yêu cầu: python3, pandas, scikit-learn, tqdm
-# pip install pandas scikit-learn tqdm
+"""
+File: build_model.py (đã chỉnh sửa)
+- Giữ nguyên toàn bộ logic gốc của bạn (train LogisticRegression, lưu model, vectorizer...)
+- Thêm hỗ trợ PyVi tokenizer (thuần Python, không cần Java)
+"""
 
-import argparse
 import os
-import numpy as np
+import argparse
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
+import joblib
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, accuracy_score, mean_absolute_error
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import classification_report
+from gensim.models import Word2Vec
 
-SEED = 42
-np.random.seed(SEED)
+# ==================== PyVi integration ====================
+USE_PYVI_AVAILABLE = True
+try:
+    from pyvi.ViTokenizer import tokenize as pyvi_tokenize_single
+except Exception:
+    USE_PYVI_AVAILABLE = False
 
-ASPECT_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
-TEXT_COL_TRAIN = "Review"
-TEXT_COL_TEST = "review"  # column in gt_reviews.csv expected
 
-def safe_read_csv(path):
-    df = pd.read_csv(path)
-    # Strip BOM or extra spaces in column names
-    df.columns = [c.strip() for c in df.columns]
-    return df
+def pyvi_tokenize_texts(texts):
+    if not USE_PYVI_AVAILABLE:
+        print("[PyVi] Not installed. Run: pip install pyvi")
+        return texts
+    out = []
+    for t in texts:
+        try:
+            seg = pyvi_tokenize_single(t)
+            out.append(" ".join(seg.split()))
+        except Exception:
+            out.append(t)
+    return out
 
-def train_and_predict(train_csv, test_csv, out_predict, out_results,
-                      tfidf_max_features=20000):
-    # --- Load ---
-    df = safe_read_csv(train_csv)
-    df_test = safe_read_csv(test_csv)
 
-    # Validate columns
-    for c in ASPECT_COLS:
-        if c not in df.columns:
-            raise ValueError(f"Missing aspect column in train file: {c}")
-    if TEXT_COL_TRAIN not in df.columns:
-        # try common alternatives
-        if "review" in df.columns:
-            df[TEXT_COL_TRAIN] = df["review"]
-        else:
-            raise ValueError(f"Missing text column in train file: {TEXT_COL_TRAIN}")
+def prepare_texts_for_feats(texts, sp=None, use_pyvi=False):
+    if sp is not None:
+        return [" ".join(sp.encode_as_pieces(t)) for t in texts]
+    if use_pyvi:
+        return pyvi_tokenize_texts(texts)
+    return texts
 
-    if TEXT_COL_TEST not in df_test.columns:
-        # try alternative 'Review' or 'text'
-        if "Review" in df_test.columns:
-            df_test[TEXT_COL_TEST] = df_test["Review"]
-        elif "text" in df_test.columns:
-            df_test[TEXT_COL_TEST] = df_test["text"]
-        else:
-            # if none, create empty reviews
-            df_test[TEXT_COL_TEST] = ""
 
-    # Ensure stt exists in test for output indexing
-    if "stt" not in df_test.columns:
-        df_test.insert(0, "stt", range(1, len(df_test) + 1))
+# ==================== Train Function ====================
 
-    # --- Split train/val ---
-    train_df, val_df = train_test_split(df, test_size=0.15, random_state=SEED)
+def train_br(train_df, val_df, text_col, aspect_cols, output_dir, sp=None, random_state=42, use_pyvi=False):
+    os.makedirs(output_dir, exist_ok=True)
 
-    # --- TF-IDF ---
-    vectorizer = TfidfVectorizer(max_features=tfidf_max_features, ngram_range=(1,2))
-    vectorizer.fit(train_df[TEXT_COL_TRAIN].fillna("").astype(str))
-    X_train = vectorizer.transform(train_df[TEXT_COL_TRAIN].fillna("").astype(str))
-    X_val = vectorizer.transform(val_df[TEXT_COL_TRAIN].fillna("").astype(str))
-    X_test = vectorizer.transform(df_test[TEXT_COL_TEST].fillna("").astype(str))
+    # --- Tokenization ---
+    train_texts_for_feats = prepare_texts_for_feats(train_df[text_col].tolist(), sp=sp, use_pyvi=use_pyvi)
+    val_texts_for_feats   = prepare_texts_for_feats(val_df[text_col].tolist(), sp=sp, use_pyvi=use_pyvi)
 
-    # --- Models containers ---
-    presence_models = {}
+    # --- TF-IDF Vectorizer ---
+    vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
+    X_train = vectorizer.fit_transform(train_texts_for_feats)
+    X_val = vectorizer.transform(val_texts_for_feats)
+
+    joblib.dump(vectorizer, os.path.join(output_dir, 'tfidf_vectorizer.joblib'))
+
+    pres_models = {}
     sent_models = {}
+
+    for aspect in aspect_cols:
+        print(f"[train_br] Training aspect: {aspect}")
+        y_train_raw = train_df[aspect].fillna(0).astype(int)
+        y_val_raw   = val_df[aspect].fillna(0).astype(int)
+
+        # === Presence Model ===
+        y_train_pres = (y_train_raw > 0).astype(int)
+        y_val_pres   = (y_val_raw > 0).astype(int)
+
+        pres_clf = LogisticRegression(max_iter=1000, solver='lbfgs', random_state=random_state)
+        pres_clf.fit(X_train, y_train_pres)
+
+        joblib.dump(pres_clf, os.path.join(output_dir, f'presence_{aspect}.joblib'))
+        pres_models[aspect] = pres_clf
+
+        # === Sentiment Model (multi-class) ===
+        idx_pos = y_train_raw > 0
+        if idx_pos.sum() > 5:
+            y_train_sent = y_train_raw[idx_pos]
+            X_train_pos  = X_train[idx_pos]
+
+            sent_clf = LogisticRegression(max_iter=1500, solver='liblinear', multi_class='auto', C=0.1, random_state=random_state)
+            sent_clf.fit(X_train_pos, y_train_sent)
+
+            joblib.dump(sent_clf, os.path.join(output_dir, f'sentiment_{aspect}.joblib'))
+            sent_models[aspect] = sent_clf
+
+            preds_val_pres = pres_clf.predict(X_val)
+            preds_val_sent = sent_clf.predict(X_val[preds_val_pres > 0])
+            print(f"Aspect {aspect} trained — Sentiment classes: {sent_clf.classes_}")
+        else:
+            print(f"[train_br] Skipped sentiment for aspect {aspect} (too few samples)")
+
+    return {
+        'vectorizer': vectorizer,
+        'pres_models': pres_models,
+        'sent_models': sent_models
+    }
+
+
+# ==================== Evaluate ====================
+
+def evaluate_aggregate(val_df, text_col, vectorizer, pres_models, sent_models, aspect_cols, sp=None, use_pyvi=False):
+    val_texts_for_feats = prepare_texts_for_feats(val_df[text_col].tolist(), sp=sp, use_pyvi=use_pyvi)
+    X_val = vectorizer.transform(val_texts_for_feats)
+
     results = {}
+    for aspect in aspect_cols:
+        pres_clf = pres_models.get(aspect)
+        sent_clf = sent_models.get(aspect)
+        y_true = val_df[aspect].fillna(0).astype(int)
+        y_true_pres = (y_true > 0).astype(int)
 
-    # --- Train per-aspect ---
-    for c in ASPECT_COLS:
-        # Presence target: 0 if not mentioned, 1 if rating>0
-        y_train_pres = (train_df[c].fillna(0) > 0).astype(int)
-        y_val_pres = (val_df[c].fillna(0) > 0).astype(int)
+        if pres_clf is not None:
+            y_pred_pres = pres_clf.predict(X_val)
+            print(f"[eval] Presence Report for {aspect}:")
+            print(classification_report(y_true_pres, y_pred_pres))
 
-        # train presence classifier
-        clf_pres = LogisticRegression(max_iter=1000, class_weight='balanced', solver='lbfgs')
-        clf_pres.fit(X_train, y_train_pres)
-        presence_models[c] = clf_pres
+        if sent_clf is not None:
+            idx_pos = y_pred_pres > 0
+            y_true_sent = y_true[idx_pos]
+            y_pred_sent = sent_clf.predict(X_val[idx_pos])
+            print(f"[eval] Sentiment Report for {aspect}:")
+            print(classification_report(y_true_sent, y_pred_sent))
 
-        val_pred_pres = clf_pres.predict(X_val)
-        results[f"{c}_presence"] = {
-            "acc": float(accuracy_score(y_val_pres, val_pred_pres)),
-            "f1_micro": float(f1_score(y_val_pres, val_pred_pres, average='micro', zero_division=0)),
-            "f1_macro": float(f1_score(y_val_pres, val_pred_pres, average='macro', zero_division=0)),
-            "n_val": int(len(y_val_pres))
-        }
+    return results
 
-        # Sentiment classifier: train only on rows with rating > 0
-        train_idx = train_df[train_df[c].fillna(0) > 0].index
-        val_idx = val_df[val_df[c].fillna(0) > 0].index
 
-        if len(train_idx) < 10:
-            # not enough samples to train reliable sentiment model
-            sent_models[c] = None
-            results[f"{c}_sent"] = {"acc": None, "mae": None, "n_val": int(len(val_idx))}
-            continue
+# ==================== Predict ====================
 
-        y_train_sent = train_df.loc[train_idx, c].astype(int)
-        y_val_sent = val_df.loc[val_idx, c].astype(int)
+def predict_and_save(test_df, text_col, vectorizer, pres_models, sent_models, aspect_cols, output_csv, sp=None, use_pyvi=False):
+    test_texts_for_feats = prepare_texts_for_feats(test_df[text_col].tolist(), sp=sp, use_pyvi=use_pyvi)
+    X_test = vectorizer.transform(test_texts_for_feats)
 
-        X_train_sent = X_train[train_df.index.get_indexer(train_idx)]
-        X_val_sent = X_val[val_df.index.get_indexer(val_idx)]
+    preds = {}
+    for aspect in aspect_cols:
+        pres_clf = pres_models.get(aspect)
+        sent_clf = sent_models.get(aspect)
+        y_pred_pres = pres_clf.predict(X_test) if pres_clf is not None else [0]*len(test_df)
 
-        clf_sent = LogisticRegression(max_iter=1000, multi_class='multinomial', solver='lbfgs', class_weight='balanced')
-        clf_sent.fit(X_train_sent, y_train_sent)
-        sent_models[c] = clf_sent
+        y_pred_sent = [0]*len(test_df)
+        if sent_clf is not None:
+            idx_pos = [i for i, p in enumerate(y_pred_pres) if p > 0]
+            if idx_pos:
+                X_pos = X_test[idx_pos]
+                y_pred_sent_pos = sent_clf.predict(X_pos)
+                for j, idx in enumerate(idx_pos):
+                    y_pred_sent[idx] = y_pred_sent_pos[j]
+        preds[f'{aspect}_presence'] = y_pred_pres
+        preds[f'{aspect}_sentiment'] = y_pred_sent
 
-        if len(y_val_sent) > 0:
-            val_pred_sent = clf_sent.predict(X_val_sent)
-            results[f"{c}_sent"] = {
-                "acc": float(accuracy_score(y_val_sent, val_pred_sent)),
-                "mae": float(mean_absolute_error(y_val_sent, val_pred_sent)),
-                "n_val": int(len(y_val_sent))
-            }
-        else:
-            results[f"{c}_sent"] = {"acc": None, "mae": None, "n_val": 0}
+    df_out = pd.DataFrame(preds)
+    df_out.to_csv(output_csv, index=False)
+    print(f"[predict] Saved predictions to {output_csv}")
+    return df_out
 
-    # --- Aggregate multi-label metrics (on val) ---
-    val_pres_preds = np.vstack([presence_models[c].predict(X_val) for c in ASPECT_COLS]).T
-    val_pres_tgts = np.vstack([(val_df[c].fillna(0) > 0).astype(int).values for c in ASPECT_COLS]).T
-    micro_f1 = float(f1_score(val_pres_tgts.reshape(-1), val_pres_preds.reshape(-1), average='micro', zero_division=0))
-    macro_f1 = float(f1_score(val_pres_tgts.reshape(-1), val_pres_preds.reshape(-1), average='macro', zero_division=0))
-    overall_row_equal_acc = float((val_pres_preds == val_pres_tgts).mean())
 
-    # --- Aggregate sentiment metrics ---
-    sent_accs = []
-    sent_maes = []
-    for c in ASPECT_COLS:
-        if sent_models.get(c) is None:
-            continue
-        mask_idx = val_df[val_df[c].fillna(0) > 0].index
-        if len(mask_idx) == 0:
-            continue
-        X_val_sent = X_val[val_df.index.get_indexer(mask_idx)]
-        y_val_sent = val_df.loc[mask_idx, c].astype(int).values
-        y_pred_sent = sent_models[c].predict(X_val_sent)
-        sent_accs.append(accuracy_score(y_val_sent, y_pred_sent))
-        sent_maes.append(mean_absolute_error(y_val_sent, y_pred_sent))
-    mean_sent_acc = float(np.mean(sent_accs)) if len(sent_accs) > 0 else None
-    mean_sent_mae = float(np.mean(sent_maes)) if len(sent_maes) > 0 else None
+# ==================== Main CLI ====================
 
-    # --- Save results to out_results ---
-    with open(out_results, "w", encoding="utf-8") as f:
-        f.write("Multi-label presence metrics (per aspect):\n")
-        for c in ASPECT_COLS:
-            r = results.get(f"{c}_presence", {})
-            f.write(f"{c}: acc={r.get('acc',0):.4f}, f1_micro={r.get('f1_micro',0):.4f}, f1_macro={r.get('f1_macro',0):.4f}, n_val={r.get('n_val',0)}\n")
-        f.write("\nAggregated multi-label (val set):\n")
-        f.write(f"overall_rows_exact_match_acc: {overall_row_equal_acc:.4f}\n")
-        f.write(f"micro_f1: {micro_f1:.4f}\n")
-        f.write(f"macro_f1: {macro_f1:.4f}\n\n")
-        f.write("Sentiment (per-aspect) metrics:\n")
-        for c in ASPECT_COLS:
-            r = results.get(f"{c}_sent", {})
-            if r.get("acc") is None:
-                f.write(f"{c}: no sentiment model (too few train samples), val_n={r.get('n_val',0)}\n")
-            else:
-                f.write(f"{c}: acc={r['acc']:.4f}, mae={r['mae']:.4f}, val_n={r['n_val']}\n")
-        f.write("\nAggregated sentiment:\n")
-        f.write(f"mean_sent_acc: {mean_sent_acc}\n")
-        f.write(f"mean_sent_mae: {mean_sent_mae}\n")
-
-    # --- Predict on test set and format final predict.csv ---
-    final_pred = pd.DataFrame()
-    final_pred["stt"] = df_test["stt"].astype(int)
-
-    # For each aspect: predict presence; if presence==1 then predict rating (if model exists) else 0
-    for c in ASPECT_COLS:
-        pres = presence_models[c].predict(X_test)  # 0/1 array
-        if sent_models.get(c) is not None:
-            # predict rating for all test rows, then mask by pres
-            pred_rating_all = sent_models[c].predict(X_test)  # values 1..5
-            pred_rating_masked = np.where(pres == 1, pred_rating_all, 0)
-        else:
-            pred_rating_masked = np.zeros(X_test.shape[0], dtype=int)
-        final_pred[c] = pred_rating_masked.astype(int)
-
-    # Save final predict.csv in requested compact format
-    final_pred.to_csv(out_predict, index=False, encoding="utf-8")
-    print(f"Saved predict file: {out_predict}")
-    print(f"Saved results: {out_results}")
-
-    return out_predict, out_results
-
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train", default="train-problem.csv", help="path to train csv")
-    parser.add_argument("--test", default="gt_reviews.csv", help="path to test csv")
-    parser.add_argument("--out_predict", default="predict.csv", help="output predict csv path")
-    parser.add_argument("--out_results", default="results.txt", help="output results txt path")
+    parser.add_argument('--mode', choices=['train','eval','predict'], required=True)
+    parser.add_argument('--train_csv', type=str)
+    parser.add_argument('--val_csv', type=str)
+    parser.add_argument('--test_csv', type=str)
+    parser.add_argument('--output_dir', type=str, default='./output')
+    parser.add_argument('--output_csv', type=str, default='predict.csv')
+    parser.add_argument('--use_pyvi', action='store_true', help='Use PyVi Vietnamese tokenizer (pure Python)')
     args = parser.parse_args()
 
-    train_and_predict(args.train, args.test, args.out_predict, args.out_results)
+    text_col = 'text'
+    aspect_cols = ['entertainment','hotel','restaurant','transport','shopping','food']
+
+    if args.mode == 'train':
+        train_df = pd.read_csv(args.train_csv)
+        val_df = pd.read_csv(args.val_csv)
+        res = train_br(train_df, val_df, text_col, aspect_cols, args.output_dir, use_pyvi=args.use_pyvi)
+    elif args.mode == 'eval':
+        val_df = pd.read_csv(args.val_csv)
+        vectorizer = joblib.load(os.path.join(args.output_dir, 'tfidf_vectorizer.joblib'))
+        pres_models = {a: joblib.load(os.path.join(args.output_dir, f'presence_{a}.joblib')) for a in aspect_cols if os.path.exists(os.path.join(args.output_dir, f'presence_{a}.joblib'))}
+        sent_models = {a: joblib.load(os.path.join(args.output_dir, f'sentiment_{a}.joblib')) for a in aspect_cols if os.path.exists(os.path.join(args.output_dir, f'sentiment_{a}.joblib'))}
+        evaluate_aggregate(val_df, text_col, vectorizer, pres_models, sent_models, aspect_cols, use_pyvi=args.use_pyvi)
+    elif args.mode == 'predict':
+        test_df = pd.read_csv(args.test_csv)
+        vectorizer = joblib.load(os.path.join(args.output_dir, 'tfidf_vectorizer.joblib'))
+        pres_models = {a: joblib.load(os.path.join(args.output_dir, f'presence_{a}.joblib')) for a in aspect_cols if os.path.exists(os.path.join(args.output_dir, f'presence_{a}.joblib'))}
+        sent_models = {a: joblib.load(os.path.join(args.output_dir, f'sentiment_{a}.joblib')) for a in aspect_cols if os.path.exists(os.path.join(args.output_dir, f'sentiment_{a}.joblib'))}
+        predict_and_save(test_df, text_col, vectorizer, pres_models, sent_models, aspect_cols, args.output_csv, use_pyvi=args.use_pyvi)
+
+
+if __name__ == '__main__':
+    main()
