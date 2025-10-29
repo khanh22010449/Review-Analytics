@@ -158,8 +158,105 @@ class FocalLoss(nn.Module):
             return focal
 
 # ---------- Model ----------
-class MultiTaskTransformer(nn.Module):
-    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, dropout=0.2):
+# class MultiTaskTransformer(nn.Module):
+#     def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, dropout=0.2):
+#         super().__init__()
+#         self.config = AutoConfig.from_pretrained(model_name)
+#         self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
+#         hidden = self.config.hidden_size
+#         self.num_aspects = num_aspects
+#         self.num_seg_classes = num_seg_classes
+
+#         # segment heads: per-aspect MLP -> outputs num_seg_classes
+#         self.segment_heads = nn.ModuleList([
+#             nn.Sequential(
+#                 nn.Linear(hidden, hidden_head),
+#                 nn.ReLU(),
+#                 nn.Dropout(dropout),
+#                 nn.Linear(hidden_head, hidden_head // 2),
+#                 nn.ReLU(),
+#                 nn.Dropout(dropout),
+#                 nn.Linear(hidden_head // 2, num_seg_classes)
+#             ) for _ in range(num_aspects)
+#         ])
+
+#         # presence head: one linear projecting pooled -> num_aspects logits
+#         # (you can replace with per-aspect MLPs if you prefer)
+#         self.presence_head = nn.Linear(hidden, num_aspects)
+
+#         self.dropout = nn.Dropout(dropout)
+
+#     def forward(self, input_ids, attention_mask):
+#         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+#         pooled = out.pooler_output if hasattr(out, "pooler_output") and out.pooler_output is not None else out.last_hidden_state[:, 0, :]
+#         pooled = self.dropout(pooled)
+#         seg_logits = torch.stack([head(pooled) for head in self.segment_heads], dim=1)  # [B,A,C]
+#         pres_logits = self.presence_head(pooled)  # [B,A]
+#         return seg_logits, pres_logits
+
+class AttentionPool(nn.Module):
+    """
+    Attention pooling: learnable queries (num_queries = num_aspects) attend over token embeddings.
+    Input: token_embeddings: [B, T, H]
+    Output: pooled: [B, num_queries, H]
+    """
+    def __init__(self, hidden_size, num_queries, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.num_queries = num_queries
+        self.hidden = hidden_size
+        self.num_heads = num_heads
+        # learnable queries
+        self.queries = nn.Parameter(torch.randn(num_queries, hidden_size) * 0.02)
+        # multihead attention: queries (num_queries), keys/values from tokens
+        self.mha = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.ln = nn.LayerNorm(hidden_size)
+        self.ff = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.GELU(), nn.Dropout(dropout))
+    def forward(self, token_emb, attn_mask=None):
+        # token_emb: [B, T, H]
+        B, T, H = token_emb.shape
+        # expand queries to batch
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)  # [B, Q, H]
+        # keys/values = token_emb
+        # MultiheadAttention with batch_first expects [B, L, E]
+        # We want queries length Q, key length T
+        # Use q as query, token_emb as key/value
+        attn_output, attn_weights = self.mha(query=q, key=token_emb, value=token_emb, key_padding_mask=None, attn_mask=None)
+        # attn_output: [B, Q, H]
+        out = self.ln(attn_output + q)  # residual
+        out = out + self.ff(out)  # feed-forward residual
+        return out  # [B, Q, H]
+
+class Adapter(nn.Module):
+    """
+    small residual adapter MLP for task-specific tuning
+    """
+    def __init__(self, hidden, bottleneck=128, dropout=0.1):
+        super().__init__()
+        self.down = nn.Linear(hidden, bottleneck)
+        self.act = nn.ReLU()
+        self.up = nn.Linear(bottleneck, hidden)
+        self.ln = nn.LayerNorm(hidden)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        # x: [B, H]
+        res = x
+        x = self.down(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.up(x)
+        x = self.dropout(x)
+        return self.ln(x + res)
+
+class EnhancedMultiTaskTransformer(nn.Module):
+    """
+    Replace the original MultiTaskTransformer with this enhanced version.
+
+    Key ideas:
+     - Attention pooling produces one vector per aspect (num_queries = num_aspects).
+     - Each per-aspect vector goes through adapter (residual) then per-aspect heads for segment and presence.
+     - Presence head outputs single logit per aspect.
+    """
+    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, pool_heads=8, dropout=0.2, adapter_bottleneck=128):
         super().__init__()
         self.config = AutoConfig.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
@@ -167,6 +264,13 @@ class MultiTaskTransformer(nn.Module):
         self.num_aspects = num_aspects
         self.num_seg_classes = num_seg_classes
 
+        # attention pooling: produce per-aspect vectors
+        self.attn_pool = AttentionPool(hidden_size=hidden, num_queries=num_aspects, num_heads=pool_heads, dropout=dropout)
+
+        # per-aspect adapters (shared module reused or separate? we use separate adapters)
+        self.adapters = nn.ModuleList([Adapter(hidden, bottleneck=adapter_bottleneck, dropout=dropout) for _ in range(num_aspects)])
+
+        # per-aspect segment heads (MLP)
         self.segment_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden, hidden_head),
@@ -178,24 +282,57 @@ class MultiTaskTransformer(nn.Module):
                 nn.Linear(hidden_head // 2, num_seg_classes)
             ) for _ in range(num_aspects)
         ])
-	self.presence_head = nn.ModuleList([
-	    nn.Sequential(
-                nn.Linear(hidden, hidden_head),
+
+        # presence head: map per-aspect vector -> single logit (we'll apply per-aspect separately)
+        self.presence_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden, hidden_head // 4),
                 nn.ReLU(),
                 nn.Dropout(dropout),
-                nn.Linear(hidden_head, hidden_head // 4),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_head // 4, num_aspects)
-	])
+                nn.Linear(hidden_head // 4, 1)
+            ) for _ in range(num_aspects)
+        ])
+
+        # final layer norms
+        self.final_ln_seg = nn.LayerNorm(hidden)
         self.dropout = nn.Dropout(dropout)
 
+        # initialization niceties
+        self._init_weights()
+
+    def _init_weights(self):
+        # small init for adapters/heads to avoid large initial outputs
+        for m in list(self.adapters) + list(self.segment_heads) + list(self.presence_heads):
+            for p in m.parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+
     def forward(self, input_ids, attention_mask):
+        # encoder
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = out.pooler_output if hasattr(out, "pooler_output") and out.pooler_output is not None else out.last_hidden_state[:,0,:]
-        pooled = self.dropout(pooled)
-        seg_logits = torch.stack([head(pooled) for head in self.segment_heads], dim=1)  # [B,A,C]
-        pres_logits = self.presence_head(pooled)
+        token_emb = out.last_hidden_state  # [B, T, H]
+        token_emb = self.dropout(token_emb)
+
+        # attention pooling -> per-aspect vectors [B, A, H]
+        pooled = self.attn_pool(token_emb)  # [B, A, H]
+
+        seg_logits_per_aspect = []
+        pres_logits_per_aspect = []
+        # iterate aspects
+        for a in range(self.num_aspects):
+            vec = pooled[:, a, :]  # [B, H]
+            vec = self.adapters[a](vec)  # [B, H]
+            # seg
+            seg_logit = self.segment_heads[a](vec)  # [B, C]
+            seg_logits_per_aspect.append(seg_logit)
+            # presence
+            pres_logit = self.presence_heads[a](vec).squeeze(-1)  # [B]
+            pres_logits_per_aspect.append(pres_logit)
+
+        # stack -> seg_logits [B, A, C], pres_logits [B, A]
+        seg_logits = torch.stack(seg_logits_per_aspect, dim=1)
+        pres_logits = torch.stack(pres_logits_per_aspect, dim=1)
+
         return seg_logits, pres_logits
 
 # ---------- Helpers: weights & sampler ----------
@@ -492,7 +629,10 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
-    model = MultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES)
+    # model = MultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES)
+    model = EnhancedMultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES,
+                                     hidden_head=512, pool_heads=8, dropout=0.2, adapter_bottleneck=128)
+
 
     per_aspect_weights = compute_per_aspect_weights(train, LABEL_COLS, NUM_SEGMENT_CLASSES)
 
