@@ -36,7 +36,7 @@ from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
 MODEL_NAME = "vinai/phobert-base"
 MAX_LEN = 256
 BATCH_SIZE = 16
-LR_ENCODER = 5e-4
+LR_ENCODER = 1e-5
 LR_HEADS = 1e-4
 NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,7 +48,7 @@ FGAMMA = 1.5
 CACHE_DIR = "bt_cache"
 AUG_TGT_LANG = "en"   # Vi -> En -> Vi back-translation
 BT_BATCH = 16         # batch size for translation generation
-NUM_WORKERS = 8
+NUM_WORKERS = 4
 GRAD_ACCUM_STEPS = 1  # increase to simulate larger batch
 WEIGHT_DECAY = 0.025
 FREEZE_ENCODER_EPOCHS = 1  # freeze encoder initially
@@ -159,7 +159,7 @@ class FocalLoss(nn.Module):
 
 # ---------- Model ----------
 class MultiTaskTransformer(nn.Module):
-    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, dropout=0.1):
+    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, dropout=0.2):
         super().__init__()
         self.config = AutoConfig.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
@@ -178,7 +178,16 @@ class MultiTaskTransformer(nn.Module):
                 nn.Linear(hidden_head // 2, num_seg_classes)
             ) for _ in range(num_aspects)
         ])
-        self.presence_head = nn.Linear(hidden, num_aspects)
+	self.presence_head = nn.ModuleList([
+	    nn.Sequential(
+                nn.Linear(hidden, hidden_head),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_head, hidden_head // 4),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_head // 4, num_aspects)
+	])
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, input_ids, attention_mask):
