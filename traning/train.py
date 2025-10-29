@@ -1,10 +1,11 @@
-from transformers import AutoTokenizer, DataCollatorWithPadding, AdamW, get_scheduler
+from transformers import AutoTokenizer, DataCollatorWithPadding, get_scheduler
 from torch.utils.data import DataLoader
 from vncorenlp import VnCoreNLP
 from tqdm.auto import tqdm
 import numpy as np
 import torch
 import random
+from torch.optim import AdamW
 
 from datasets import load_dataset
 from preprocessing import Preprocess
