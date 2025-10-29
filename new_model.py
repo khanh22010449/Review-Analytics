@@ -1,171 +1,514 @@
-# train_final.py
-import math, random, numpy as np, pandas as pd
+# nn_bt.py
+"""
+Multi-task multi-label + segment training with optional offline back-translation augmentation.
+How to use:
+  1) Ensure transformers, torch, sentencepiece are installed.
+  2) Run: python nn_bt.py --data_dir data --do_augment True
+     The first run will download Marian models and create data/train_aug.csv (cached).
+  3) Train will use AMP, gradient accumulation, optional sampler, and save best model to best_multitask_weighted.pt
+"""
+
+import os
+import argparse
+import random
+import math
+import json
 from pathlib import Path
-import torch, torch.nn as nn, torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel, AutoConfig, get_linear_schedule_with_warmup
-from sklearn.metrics import f1_score, accuracy_score
 from tqdm.auto import tqdm
 
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.cuda.amp import autocast, GradScaler
+
+from transformers import (AutoTokenizer, AutoModel, AutoConfig,
+                          get_linear_schedule_with_warmup,
+                          MarianMTModel, MarianTokenizer)
+
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
+
+# ---------------- Config ----------------
 MODEL_NAME = "vinai/phobert-base"
+MAX_LEN = 256
+BATCH_SIZE = 16
+LR_ENCODER = 5e-4
+LR_HEADS = 1e-4
+NUM_EPOCHS = 50
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LABEL_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
 NUM_ASPECTS = len(LABEL_COLS)
-NUM_SEG_CLASSES = 5
+NUM_SEGMENT_CLASSES = 5
+USE_FOCAL = True
+FGAMMA = 1.5
+CACHE_DIR = "bt_cache"
+AUG_TGT_LANG = "en"   # Vi -> En -> Vi back-translation
+BT_BATCH = 16         # batch size for translation generation
+NUM_WORKERS = 8
+GRAD_ACCUM_STEPS = 1  # increase to simulate larger batch
+WEIGHT_DECAY = 0.025
+FREEZE_ENCODER_EPOCHS = 1  # freeze encoder initially
+# ----------------------------------------
 
-# Text cleaning (reuse)
-import re
+# ---------- Utilities ----------
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+seed_everything(42)
+
+# ---------- Text cleaning ----------
+import re, html
 from bs4 import BeautifulSoup
-def clean_text(t): return re.sub(r"\s+"," ", BeautifulSoup(str(t),"html.parser").get_text()).strip()
 
-# Dataset
-class TrainDataset(Dataset):
-    def __init__(self, df, tokenizer, max_len=128):
-        self.texts = [clean_text(t) for t in df['Review'].astype(str).tolist()]
-        self.labels = df[LABEL_COLS].astype(int).values
-        # detect is_pseudo column if exists
-        self.is_pseudo = df['is_pseudo'].values if 'is_pseudo' in df.columns else np.zeros(len(df), dtype=int)
-        self.tokenizer = tokenizer; self.max_len = max_len
-    def __len__(self): return len(self.texts)
+def clean_text(text: str) -> str:
+    text = BeautifulSoup(str(text), "html.parser").get_text()
+    text = html.unescape(text)
+    text = re.sub(r"[^a-zA-Z0-9À-Ỹà-ỹ\s.,!?;:'\"%&$()\-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# ---------- Dataset ----------
+class ReviewDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, tokenizer, max_len=256, label_cols=LABEL_COLS,
+                 augment_fn=None, augment_prob=0.0, augment_minority_only=False, minority_map=None):
+        self.df = df.reset_index(drop=True)
+        self.texts = self.df['Review'].astype(str).tolist()
+        self.labels = self.df[label_cols].values  # 0..5
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.augment_fn = augment_fn
+        self.augment_prob = augment_prob
+        self.augment_minority_only = augment_minority_only
+        self.minority_map = minority_map or {}  # {col: set(classes_to_aug)}
+
+    def __len__(self):
+        return len(self.texts)
+
     def __getitem__(self, idx):
-        t = self.texts[idx]
-        tok = self.tokenizer(t, truncation=True, padding='max_length', max_length=self.max_len, return_tensors='pt')
-        seg_raw = self.labels[idx].astype(int)
-        pres = (seg_raw > 0).astype(float)
-        seg = np.where(seg_raw > 0, seg_raw - 1, -1)
-        return {'input_ids': tok['input_ids'].squeeze(0), 'attention_mask': tok['attention_mask'].squeeze(0),
-                'pres': torch.tensor(pres, dtype=torch.float), 'seg': torch.tensor(seg, dtype=torch.long),
-                'is_pseudo': int(self.is_pseudo[idx])}
+        text = self.texts[idx]
+        row_labels = self.labels[idx].astype(np.int64)  # 0..5
+
+        if self.augment_fn and random.random() < self.augment_prob:
+            if not self.augment_minority_only:
+                text = self.augment_fn(text)
+            else:
+                # only augment if any aspect belongs to minority classes (mapped 0..4)
+                do_aug = False
+                for i, col in enumerate(LABEL_COLS):
+                    val = row_labels[i]
+                    if val > 0 and val-1 in self.minority_map.get(col, set()):
+                        do_aug = True
+                        break
+                if do_aug:
+                    text = self.augment_fn(text)
+
+        text = clean_text(text)
+        tok = self.tokenizer(text, truncation=True, padding='max_length', max_length=self.max_len, return_tensors='pt')
+        seg_labels_raw = row_labels
+        pres_labels = (seg_labels_raw > 0).astype(np.float32)
+        seg_labels = np.where(seg_labels_raw > 0, seg_labels_raw - 1, -1)
+
+        return {
+            'input_ids': tok['input_ids'].squeeze(0),
+            'attention_mask': tok['attention_mask'].squeeze(0),
+            'seg_labels': torch.tensor(seg_labels, dtype=torch.long),
+            'pres_labels': torch.tensor(pres_labels, dtype=torch.float)
+        }
 
 def collate_fn(batch):
-    import torch
-    input_ids = torch.stack([b['input_ids'] for b in batch])
-    attention_mask = torch.stack([b['attention_mask'] for b in batch])
-    pres = torch.stack([b['pres'] for b in batch])
-    seg = torch.stack([b['seg'] for b in batch])
-    is_pseudo = torch.tensor([b['is_pseudo'] for b in batch], dtype=torch.float)
-    return {'input_ids': input_ids, 'attention_mask': attention_mask, 'pres': pres, 'seg': seg, 'is_pseudo': is_pseudo}
+    input_ids = torch.stack([x['input_ids'] for x in batch])
+    attention_mask = torch.stack([x['attention_mask'] for x in batch])
+    seg_labels = torch.stack([x['seg_labels'] for x in batch])
+    pres_labels = torch.stack([x['pres_labels'] for x in batch])
+    return {'input_ids': input_ids, 'attention_mask': attention_mask, 'seg_labels': seg_labels, 'pres_labels': pres_labels}
 
-# Model (reuse same architecture as new_model.py)
-class SimpleMultiTask(nn.Module):
-    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512):
+# ---------- Focal Loss (with ignore_index) ----------
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None, ignore_index=-1, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
+
+    def forward(self, logits, target):
+        loss = self.ce(logits, target)
+        if self.ignore_index is not None:
+            mask = (target != self.ignore_index).float()
+            loss = loss * mask
+        else:
+            mask = torch.ones_like(loss)
+        pt = torch.exp(-loss)
+        focal = ((1 - pt) ** self.gamma) * loss
+        if self.reduction == 'mean':
+            denom = mask.sum().clamp_min(1.0)
+            return focal.sum() / denom
+        elif self.reduction == 'sum':
+            return focal.sum()
+        else:
+            return focal
+
+# ---------- Model ----------
+class MultiTaskTransformer(nn.Module):
+    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, dropout=0.1):
         super().__init__()
         self.config = AutoConfig.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
         hidden = self.config.hidden_size
-        self.segment_heads = nn.ModuleList([ nn.Sequential(nn.Linear(hidden, hidden_head), nn.ReLU(), nn.Linear(hidden_head, num_seg_classes)) for _ in range(num_aspects) ])
+        self.num_aspects = num_aspects
+        self.num_seg_classes = num_seg_classes
+
+        self.segment_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden, hidden_head),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_head, hidden_head // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_head // 2, num_seg_classes)
+            ) for _ in range(num_aspects)
+        ])
         self.presence_head = nn.Linear(hidden, num_aspects)
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, input_ids, attention_mask):
-        o = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = o.pooler_output if hasattr(o,'pooler_output') and o.pooler_output is not None else o.last_hidden_state[:,0,:]
+        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = out.pooler_output if hasattr(out, "pooler_output") and out.pooler_output is not None else out.last_hidden_state[:,0,:]
         pooled = self.dropout(pooled)
-        seg_logits = torch.stack([h(pooled) for h in self.segment_heads], dim=1)
+        seg_logits = torch.stack([head(pooled) for head in self.segment_heads], dim=1)  # [B,A,C]
         pres_logits = self.presence_head(pooled)
         return seg_logits, pres_logits
 
-def train_epoch(model, loader, opt, device, pseudo_weight=0.3):
-    model.train()
-    tot=0.0; steps=0
-    for b in loader:
-        input_ids=b['input_ids'].to(device); attention_mask=b['attention_mask'].to(device)
-        seg=b['seg'].to(device); pres=b['pres'].to(device); is_pseudo=b['is_pseudo'].to(device)
-        seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
-        # compute seg loss per-aspect robustly
-        A = seg_logits.shape[1]
-        loss_seg_sum = 0.0; valid_aspects=0
-        for a in range(A):
-            loss_vec = F.cross_entropy(seg_logits[:,a,:], seg[:,a], ignore_index=-1, reduction='none')
-            mask = (seg[:,a] != -1)
-            if mask.sum() == 0: continue
-            loss_a = loss_vec[mask].mean()
-            loss_seg_sum += loss_a; valid_aspects += 1
-        loss_seg = loss_seg_sum/valid_aspects if valid_aspects>0 else torch.tensor(0.0, device=device)
-        loss_pres = F.binary_cross_entropy_with_logits(pres_logits, pres)
-        # combine, weight pseudo samples
-        # create per-batch weighting: samples pseudo have weight pseudo_weight, real weight 1.0
-        weights = (1.0 - (1.0 - pseudo_weight)*is_pseudo)  # pseudo->pseudo_weight, real->1.0
-        # We apply sample weighting only to reduce epoch-level effect by scaling loss
-        loss = (1.5*loss_seg + 1.0*loss_pres) * weights.mean()
-        opt.zero_grad(); loss.backward(); opt.step()
-        tot += float(loss.item()); steps+=1
-    return tot/steps if steps>0 else 0.0
+# ---------- Helpers: weights & sampler ----------
+def compute_per_aspect_weights(train_df, label_cols, num_seg_classes):
+    weights_list = []
+    for col in label_cols:
+        vals = train_df[col].values
+        vals_pos = vals[vals > 0]
+        if len(vals_pos) == 0:
+            weights_list.append(None)
+            continue
+        mapped = (vals_pos - 1).astype(int)
+        classes = np.arange(num_seg_classes)
+        cw = compute_class_weight(class_weight='balanced', classes=classes, y=mapped)
+        cw = torch.tensor(cw, dtype=torch.float)
+        weights_list.append(cw)
+    return weights_list
 
-# simple eval on val
-def evaluate(model, val_loader, device):
-    model.eval()
-    seg_preds=[]; seg_trues=[]
-    pres_preds=[]; pres_trues=[]
-    with torch.no_grad():
-        for b in val_loader:
-            input_ids=b['input_ids'].to(device); attention_mask=b['attention_mask'].to(device)
-            seg=b['seg'].numpy(); pres=b['pres'].numpy()
-            seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
-            seg_p = torch.argmax(seg_logits, dim=-1).cpu().numpy()  # 0..C-1
-            pres_p = (torch.sigmoid(pres_logits).cpu().numpy() >= 0.5).astype(int)
-            seg_preds.append(seg_p); seg_trues.append(seg)
-            pres_preds.append(pres_p); pres_trues.append(pres)
-    import numpy as np
-    seg_preds = np.vstack(seg_preds); seg_trues = np.vstack(seg_trues)
-    pres_preds = np.vstack(pres_preds); pres_trues = np.vstack(pres_trues)
-    # compute metrics similar to before
-    A = seg_preds.shape[1]
-    accs=[]; f1s=[]
-    for a in range(A):
-        mask = seg_trues[:,a] != -1
-        if mask.sum()==0: continue
-        accs.append(accuracy_score(seg_trues[mask,a], seg_preds[mask,a]))
-        f1s.append(f1_score(seg_trues[mask,a], seg_preds[mask,a], average='macro', zero_division=0))
-    metrics = {
-        'seg_acc_mean': float(np.mean(accs) if accs else 0.0),
-        'seg_f1_macro_mean': float(np.mean(f1s) if f1s else 0.0),
-        'pres_f1_micro': float(f1_score(pres_trues.reshape(-1), pres_preds.reshape(-1), average='micro', zero_division=0)),
-        'pres_f1_macro': float(f1_score(pres_trues.reshape(-1), pres_preds.reshape(-1), average='macro', zero_division=0))
-    }
+def make_multi_aspect_sampler(df, label_cols, num_seg_classes):
+    # create sample weight = max(1/class_freq_for_each_aspect) across aspects, ignore -1 with small weight
+    n = len(df)
+    sample_weights = np.zeros(n, dtype=float)
+    for col in label_cols:
+        vals = df[col].values
+        mapped = np.where(vals > 0, vals-1, -1)
+        counts = {}
+        for c in range(num_seg_classes):
+            counts[c] = np.sum(mapped == c)
+        col_weights = np.array([0.1 if v==-1 else 1.0/(counts[int(v)]+1e-9) for v in mapped])
+        sample_weights = np.maximum(sample_weights, col_weights)
+    sample_weights = sample_weights / (sample_weights.mean() + 1e-12)
+    return WeightedRandomSampler(weights=sample_weights.tolist(), num_samples=n, replacement=True)
+
+# ---------- Metrics ----------
+def compute_metrics_seg_and_pres(seg_logits, pres_logits, seg_targets, pres_targets, threshold=0.5):
+    seg_preds = torch.argmax(seg_logits, dim=-1).cpu().numpy()
+    seg_true = seg_targets.cpu().numpy()
+    pres_probs = torch.sigmoid(pres_logits).cpu().numpy()
+    pres_preds = (pres_probs >= threshold).astype(int)
+    pres_true = pres_targets.cpu().numpy().astype(int)
+
+    metrics = {}
+    accs, f1s_seg = [], []
+    for a in range(seg_true.shape[1]):
+        mask = seg_true[:, a] != -1
+        if np.sum(mask) == 0:
+            continue
+        accs.append(accuracy_score(seg_true[mask,a], seg_preds[mask,a]))
+        f1s_seg.append(f1_score(seg_true[mask,a], seg_preds[mask,a], average='macro', zero_division=0))
+    metrics['seg_acc_mean'] = float(np.mean(accs) if accs else 0.0)
+    metrics['seg_f1_macro_mean'] = float(np.mean(f1s_seg) if f1s_seg else 0.0)
+    metrics['pres_f1_micro'] = float(f1_score(pres_true.reshape(-1), pres_preds.reshape(-1), average='micro', zero_division=0))
+    metrics['pres_f1_macro'] = float(f1_score(pres_true.reshape(-1), pres_preds.reshape(-1), average='macro', zero_division=0))
     return metrics
 
-if __name__ == "__main__":
-    import argparse
+# ---------- Back-translation (offline, batched) ----------
+def prepare_bt_models(src='vi', mid='en', cache_dir=CACHE_DIR):
+    os.makedirs(cache_dir, exist_ok=True)
+    name_1 = f'Helsinki-NLP/opus-mt-{src}-{mid}'
+    name_2 = f'Helsinki-NLP/opus-mt-{mid}-{src}'
+    tok1 = MarianTokenizer.from_pretrained(name_1, cache_dir=cache_dir)
+    m1 = MarianMTModel.from_pretrained(name_1, cache_dir=cache_dir)
+    tok2 = MarianTokenizer.from_pretrained(name_2, cache_dir=cache_dir)
+    m2 = MarianMTModel.from_pretrained(name_2, cache_dir=cache_dir)
+    return (tok1, m1), (tok2, m2)
+
+def back_translate_texts(texts, model_pair, batch_size=16, device=None):
+    (tok1, m1), (tok2, m2) = model_pair
+    if device:
+        m1.to(device); m2.to(device)
+    results = []
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i+batch_size]
+        inputs = tok1(batch_texts, return_tensors="pt", padding=True, truncation=True).to(m1.device)
+        with torch.no_grad():
+            out = m1.generate(**inputs, num_beams=4, max_length=256)
+            mids = tok1.batch_decode(out, skip_special_tokens=True)
+        inputs2 = tok2(mids, return_tensors="pt", padding=True, truncation=True).to(m2.device)
+        with torch.no_grad():
+            out2 = m2.generate(**inputs2, num_beams=4, max_length=256)
+            backs = tok2.batch_decode(out2, skip_special_tokens=True)
+        results.extend(backs)
+    return results
+
+def do_offline_back_translation(train_df, cache_dir=CACHE_DIR, mid_lang=AUG_TGT_LANG, bt_batch=BT_BATCH):
+    """
+    Train_df must have 'Review' column.
+    This function will:
+      - If cached file exists return path
+      - Else run BT for all train reviews and create train_aug.csv (original + augmented)
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_meta = Path(cache_dir) / "bt_meta.json"
+    cached_csv = Path(cache_dir) / "train_aug_bt.csv"
+
+    # if cache exists return quickly
+    if cached_csv.exists():
+        print("Found cached augmented file:", cached_csv)
+        return str(cached_csv)
+
+    print("Preparing BT models (this will download models if not present)...")
+    model_pair = prepare_bt_models(src='vi', mid=mid_lang, cache_dir=cache_dir)
+
+    texts = train_df['Review'].astype(str).tolist()
+    print(f"Back-translating {len(texts)} samples in batches of {bt_batch} ...")
+    bt_texts = back_translate_texts(texts, model_pair, batch_size=bt_batch, device='cpu')  # use cpu by default for compatibility
+    if len(bt_texts) != len(texts):
+        raise RuntimeError("Mismatch bt lengths")
+
+    # Create augmented DataFrame (one augmented per original). You can increase to more copies if desired.
+    df_aug = train_df.copy()
+    df_aug['Review'] = bt_texts
+    df_concat = pd.concat([train_df, df_aug], ignore_index=True).sample(frac=1, random_state=42).reset_index(drop=True)
+    df_concat.to_csv(cached_csv, index=False)
+    # save meta
+    with open(cache_meta, "w") as f:
+        json.dump({"src": "vi", "mid": mid_lang, "n_orig": len(train_df), "n_aug": len(df_aug)}, f)
+    print("Saved augmented CSV to:", cached_csv)
+    return str(cached_csv)
+
+# ---------- Train / Validate / Predict ----------
+def validate(val_loader, model, device='cpu'):
+    model.eval()
+    seg_logits_all, pres_logits_all, seg_t_all, pres_t_all = [], [], [], []
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Valid", leave=False):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            seg_labels = batch['seg_labels'].to(device)
+            pres_labels = batch['pres_labels'].to(device)
+            seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            seg_logits_all.append(seg_logits.cpu())
+            pres_logits_all.append(pres_logits.cpu())
+            seg_t_all.append(seg_labels.cpu())
+            pres_t_all.append(pres_labels.cpu())
+    seg_logits = torch.cat(seg_logits_all)
+    pres_logits = torch.cat(pres_logits_all)
+    seg_t = torch.cat(seg_t_all)
+    pres_t = torch.cat(pres_t_all)
+    return compute_metrics_seg_and_pres(seg_logits, pres_logits, seg_t, pres_t)
+
+def train_loop_with_weights(train_loader, val_loader, model, optimizer, scheduler=None,
+               num_epochs=3, device='cpu', w_seg=1.0, w_pres=1.0,
+               seg_loss_type='focal', per_aspect_weights=None, gamma=2.0,
+               freeze_encoder_epochs=0, grad_accum_steps=1, fp16=True):
+    model.to(device)
+    scaler = GradScaler() if fp16 and device == 'cuda' else None
+    bce_loss = nn.BCEWithLogitsLoss()
+    # Setup loss per-aspect
+    per_aspect_loss = []
+    for w in per_aspect_weights:
+        w_t = w.to(device) if w is not None else None
+        if seg_loss_type == 'focal':
+            per_aspect_loss.append(FocalLoss(gamma=gamma, weight=w_t, ignore_index=-1))
+        else:
+            per_aspect_loss.append(nn.CrossEntropyLoss(weight=w_t, ignore_index=-1))
+
+    best_val = None
+    global_step = 0
+    for epoch in range(num_epochs):
+        model.train()
+        if epoch < freeze_encoder_epochs:
+            # freeze encoder
+            for p in model.encoder.parameters():
+                p.requires_grad = False
+            print(f"Epoch {epoch+1}: encoder frozen")
+        else:
+            for p in model.encoder.parameters():
+                p.requires_grad = True
+
+        pbar = tqdm(train_loader, desc=f"Train E{epoch+1}")
+        total_loss = 0.0
+        optimizer.zero_grad()
+        for step, batch in enumerate(pbar):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            seg_labels = batch['seg_labels'].to(device)
+            pres_labels = batch['pres_labels'].to(device)
+
+            if scaler:
+                with autocast():
+                    seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                    B,A,C = seg_logits.shape
+                    loss_seg = 0.0
+                    for a in range(A):
+                        loss_a = per_aspect_loss[a](seg_logits[:,a,:], seg_labels[:,a])
+                        loss_seg += loss_a
+                    loss_seg = loss_seg / max(1, A)
+                    loss_pres = bce_loss(pres_logits, pres_labels)
+                    loss = w_seg * loss_seg + w_pres * loss_pres
+                scaler.scale(loss).backward()
+                if (step+1) % grad_accum_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    if scheduler is not None:
+                        scheduler.step()
+            else:
+                seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                B,A,C = seg_logits.shape
+                loss_seg = 0.0
+                for a in range(A):
+                    loss_a = per_aspect_loss[a](seg_logits[:,a,:], seg_labels[:,a])
+                    loss_seg += loss_a
+                loss_seg = loss_seg / max(1, A)
+                loss_pres = bce_loss(pres_logits, pres_labels)
+                loss = w_seg * loss_seg + w_pres * loss_pres
+                loss.backward()
+                if (step+1) % grad_accum_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    if scheduler is not None:
+                        scheduler.step()
+
+            total_loss += float(loss.detach().cpu().item())
+            pbar.set_postfix({'loss': total_loss / (step+1)})
+
+            global_step += 1
+
+        val_metrics = validate(val_loader, model, device)
+        print(f"Epoch {epoch+1} val metrics:", val_metrics)
+
+        # selection metric (can be tuned)
+        score = val_metrics['pres_f1_micro'] + val_metrics['seg_f1_macro_mean']
+        if best_val is None or score > best_val:
+            best_val = score
+            torch.save(model.state_dict(), "best_multitask_weighted.pt")
+            print("Saved best model.")
+
+    print("Training finished. Best score:", best_val)
+
+# ---------- Predict helper ----------
+def predict_and_save(model, data_loader, output_path="predictions.csv", device='cpu', threshold=0.5):
+    model.to(device)
+    model.eval()
+    rows = []
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Predict"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            seg_logits, pres_logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            seg_preds = torch.argmax(seg_logits, dim=-1).cpu().numpy()  # 0..4
+            pres_probs = torch.sigmoid(pres_logits).cpu().numpy()
+            pres_preds = (pres_probs >= threshold).astype(int)
+            B = seg_preds.shape[0]
+            for i in range(B):
+                row = {}
+                for j, col in enumerate(LABEL_COLS):
+                    present = int(pres_preds[i,j])
+                    seg = int(seg_preds[i,j]) + 1 if present else 0  # map back to 0..5 original scale
+                    row[col] = seg
+                rows.append(row)
+    df_out = pd.DataFrame(rows)
+    df_out.to_csv(output_path, index=False)
+    print("Saved predictions to", output_path)
+    return output_path
+
+# ---------- Main ----------
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default="data")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--pseudo_weight", type=float, default=0.4, help="loss weight for pseudo samples (0..1)")
+    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--do_augment", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--bt_mid", type=str, default=AUG_TGT_LANG)
+    parser.add_argument("--aug_cache_dir", type=str, default=CACHE_DIR)
+    parser.add_argument("--fp16", type=lambda x: x.lower() == "true", default=True)
+    parser.add_argument("--grad_accum", type=int, default=GRAD_ACCUM_STEPS)
+    parser.add_argument("--num_workers", type=int, default=NUM_WORKERS)
     args = parser.parse_args()
 
-    train_all = pd.read_csv(Path(args.data_dir)/"train_pseudo_aug_v2.csv")
-    # Heuristic: if no explicit is_pseudo column, assume last N rows are pseudo
-    if 'is_pseudo' not in train_all.columns:
-        # if file size > original_train (1927) we mark appended rows as pseudo
-        orig = pd.read_csv(Path(args.data_dir)/"problem_train.csv")
-        n_orig = len(orig)
-        train_all['is_pseudo'] = [0]*len(train_all)
-        for i in range(n_orig, len(train_all)):
-            train_all.at[i,'is_pseudo'] = 1
+    data_dir = Path(args.data_dir)
+    train_csv = data_dir / "problem_train.csv"
+    val_csv = data_dir / "problem_val.csv"
+    test_csv = data_dir / "problem_test.csv"
 
-    val_df = pd.read_csv(Path(args.data_dir)/"problem_val.csv")
+    train = pd.read_csv(train_csv)
+    val = pd.read_csv(val_csv)
+    test = pd.read_csv(test_csv)
+
+    if args.do_augment:
+        aug_path = do_offline_back_translation(train, cache_dir=args.aug_cache_dir, mid_lang=args.bt_mid, bt_batch=BT_BATCH)
+        train = pd.read_csv(aug_path)
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    train_ds = TrainDataset(train_all, tokenizer, max_len=128)
-    val_ds = TrainDataset(val_df, tokenizer, max_len=128)
-    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=collate_fn, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, collate_fn=collate_fn, num_workers=2)
+    train_ds = ReviewDataset(train, tokenizer, max_len=MAX_LEN)
+    val_ds = ReviewDataset(val, tokenizer, max_len=MAX_LEN)
+    test_ds = ReviewDataset(test, tokenizer, max_len=MAX_LEN)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SimpleMultiTask(MODEL_NAME, NUM_ASPECTS, NUM_SEG_CLASSES, hidden_head=512).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    total_steps = len(train_loader)*args.epochs
-    scheduler = get_linear_schedule_with_warmup(opt, num_warmup_steps=int(0.06*total_steps), num_training_steps=total_steps)
+    # Optional: sampler to balance batches
+    sampler = make_multi_aspect_sampler(train, LABEL_COLS, NUM_SEGMENT_CLASSES)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=args.num_workers, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
-    best_score = None
-    for ep in range(args.epochs):
-        loss = train_epoch(model, train_loader, opt, device, pseudo_weight=args.pseudo_weight)
-        scheduler.step()
-        print(f"Epoch {ep+1} train_loss {loss:.4f}")
-        metrics = evaluate(model, val_loader, device)
-        print("Val metrics:", metrics)
-        score = metrics['seg_f1_macro_mean'] + metrics['pres_f1_micro']
-        if best_score is None or score > best_score:
-            best_score = score
-            torch.save(model.state_dict(), Path(args.data_dir)/"final_model_best.pt")
-            print("Saved final_model_best.pt")
-    print("Done. Best score:", best_score)
+    model = MultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES)
+
+    per_aspect_weights = compute_per_aspect_weights(train, LABEL_COLS, NUM_SEGMENT_CLASSES)
+
+    # per-parameter LR
+    optimizer = torch.optim.AdamW([
+        {'params': model.encoder.parameters(), 'lr': LR_ENCODER},
+        {'params': model.segment_heads.parameters(), 'lr': LR_HEADS},
+        {'params': model.presence_head.parameters(), 'lr': LR_HEADS}
+    ], weight_decay=WEIGHT_DECAY)
+
+    total_steps = len(train_loader) * NUM_EPOCHS // max(1, args.grad_accum)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.06 * total_steps), num_training_steps=total_steps)
+
+    seg_loss_type = 'focal' if USE_FOCAL else 'ce'
+    train_loop_with_weights(train_loader, val_loader, model, optimizer, scheduler,
+               num_epochs=NUM_EPOCHS, device=DEVICE, w_seg=1.5, w_pres=1.0,
+               seg_loss_type=seg_loss_type, per_aspect_weights=per_aspect_weights, gamma=FGAMMA,
+               freeze_encoder_epochs=FREEZE_ENCODER_EPOCHS, grad_accum_steps=args.grad_accum, fp16=args.fp16)
+
+    # Evaluate on test
+    test_metrics = validate(test_loader, model, device=DEVICE)
+    print("Test metrics:", test_metrics)
+
+    # Save predictions
+    predict_and_save(model, test_loader, output_path="data/predictions.csv", device=DEVICE)
+
+if __name__ == "__main__":
+    main()
