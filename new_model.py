@@ -22,16 +22,16 @@ from sklearn.metrics import precision_recall_fscore_support, f1_score
 # ----------------------------
 # CONFIG (TUNE ở đây)
 # ----------------------------
-TRAIN_CSV = "problem_train.csv"
-VAL_CSV = "problem_val.csv"
-TEST_CSV = "problem_test.csv"
-MODEL_NAME = "bert-base-multilingual-cased"  # hoặc 'vinai/phobert-base' nếu tiếng Việt
+TRAIN_CSV = "data/problem_train.csv"
+VAL_CSV = "data/problem_val.csv"
+TEST_CSV = "data/problem_test.csv"
+MODEL_NAME = "vinai/phobert-base"  # hoặc 'vinai/phobert-base' nếu tiếng Việt
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LABEL_COLS = ['giai_tri', 'luu_tru', 'nha_hang', 'an_uong', 'van_chuyen', 'mua_sam']
 NUM_SEGMENT_CLASSES = 5  # 1..5 -> mapped 0..4
 MAX_LEN = 128
 BATCH_SIZE = 16  # TUNE
-EPOCHS = 6
+EPOCHS = 30
 LR_ENCODER = 1e-5
 LR_HEADS = 2e-4
 WEIGHT_DECAY = 1e-2
