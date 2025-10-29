@@ -1,11 +1,14 @@
-# nn_bt.py
+# nn_bt_fixed.py
 """
 Multi-task multi-label + segment training with optional offline back-translation augmentation.
-How to use:
-  1) Ensure transformers, torch, sentencepiece are installed.
-  2) Run: python nn_bt.py --data_dir data --do_augment True
-     The first run will download Marian models and create data/train_aug.csv (cached).
-  3) Train will use AMP, gradient accumulation, optional sampler, and save best model to best_multitask_weighted.pt
+Features:
+ - Enhanced architecture with Attention Pooling + Adapters + per-aspect heads
+ - Offline back-translation cache
+ - Focal loss with ignore_index support
+ - Weighted sampler to mitigate class imbalance
+ - AMP training support
+Usage:
+  python nn_bt_fixed.py --data_dir data --do_augment True
 """
 
 import os
@@ -52,6 +55,10 @@ NUM_WORKERS = 4
 GRAD_ACCUM_STEPS = 1  # increase to simulate larger batch
 WEIGHT_DECAY = 0.025
 FREEZE_ENCODER_EPOCHS = 1  # freeze encoder initially
+# Enhanced model defaults
+ENH_HIDDEN_HEAD = 512
+ENH_POOL_HEADS = 8
+ENH_ADAPTER_BOTTLENECK = 128
 # ----------------------------------------
 
 # ---------- Utilities ----------
@@ -71,6 +78,7 @@ from bs4 import BeautifulSoup
 def clean_text(text: str) -> str:
     text = BeautifulSoup(str(text), "html.parser").get_text()
     text = html.unescape(text)
+    # keep Vietnamese letters, basic punctuation
     text = re.sub(r"[^a-zA-Z0-9À-Ỹà-ỹ\s.,!?;:'\"%&$()\-]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -141,12 +149,14 @@ class FocalLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
 
     def forward(self, logits, target):
-        loss = self.ce(logits, target)
+        # logits: [B, C], target: [B]
+        loss = self.ce(logits, target)  # shape [B]
         if self.ignore_index is not None:
             mask = (target != self.ignore_index).float()
             loss = loss * mask
         else:
             mask = torch.ones_like(loss)
+        # compute pt as exp(-CE) per-sample
         pt = torch.exp(-loss)
         focal = ((1 - pt) ** self.gamma) * loss
         if self.reduction == 'mean':
@@ -157,43 +167,7 @@ class FocalLoss(nn.Module):
         else:
             return focal
 
-# ---------- Model ----------
-# class MultiTaskTransformer(nn.Module):
-#     def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, dropout=0.2):
-#         super().__init__()
-#         self.config = AutoConfig.from_pretrained(model_name)
-#         self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
-#         hidden = self.config.hidden_size
-#         self.num_aspects = num_aspects
-#         self.num_seg_classes = num_seg_classes
-
-#         # segment heads: per-aspect MLP -> outputs num_seg_classes
-#         self.segment_heads = nn.ModuleList([
-#             nn.Sequential(
-#                 nn.Linear(hidden, hidden_head),
-#                 nn.ReLU(),
-#                 nn.Dropout(dropout),
-#                 nn.Linear(hidden_head, hidden_head // 2),
-#                 nn.ReLU(),
-#                 nn.Dropout(dropout),
-#                 nn.Linear(hidden_head // 2, num_seg_classes)
-#             ) for _ in range(num_aspects)
-#         ])
-
-#         # presence head: one linear projecting pooled -> num_aspects logits
-#         # (you can replace with per-aspect MLPs if you prefer)
-#         self.presence_head = nn.Linear(hidden, num_aspects)
-
-#         self.dropout = nn.Dropout(dropout)
-
-#     def forward(self, input_ids, attention_mask):
-#         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-#         pooled = out.pooler_output if hasattr(out, "pooler_output") and out.pooler_output is not None else out.last_hidden_state[:, 0, :]
-#         pooled = self.dropout(pooled)
-#         seg_logits = torch.stack([head(pooled) for head in self.segment_heads], dim=1)  # [B,A,C]
-#         pres_logits = self.presence_head(pooled)  # [B,A]
-#         return seg_logits, pres_logits
-
+# ---------- Enhanced Model: Attention Pool, Adapter, per-aspect heads ----------
 class AttentionPool(nn.Module):
     """
     Attention pooling: learnable queries (num_queries = num_aspects) attend over token embeddings.
@@ -217,11 +191,7 @@ class AttentionPool(nn.Module):
         # expand queries to batch
         q = self.queries.unsqueeze(0).expand(B, -1, -1)  # [B, Q, H]
         # keys/values = token_emb
-        # MultiheadAttention with batch_first expects [B, L, E]
-        # We want queries length Q, key length T
-        # Use q as query, token_emb as key/value
         attn_output, attn_weights = self.mha(query=q, key=token_emb, value=token_emb, key_padding_mask=None, attn_mask=None)
-        # attn_output: [B, Q, H]
         out = self.ln(attn_output + q)  # residual
         out = out + self.ff(out)  # feed-forward residual
         return out  # [B, Q, H]
@@ -249,14 +219,12 @@ class Adapter(nn.Module):
 
 class EnhancedMultiTaskTransformer(nn.Module):
     """
-    Replace the original MultiTaskTransformer with this enhanced version.
-
-    Key ideas:
-     - Attention pooling produces one vector per aspect (num_queries = num_aspects).
-     - Each per-aspect vector goes through adapter (residual) then per-aspect heads for segment and presence.
-     - Presence head outputs single logit per aspect.
+    Enhanced multi-task model using attention pooling and adapters.
+    Outputs:
+      seg_logits: [B, A, C]
+      pres_logits: [B, A]
     """
-    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=512, pool_heads=8, dropout=0.2, adapter_bottleneck=128):
+    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=ENH_HIDDEN_HEAD, pool_heads=ENH_POOL_HEADS, dropout=0.2, adapter_bottleneck=ENH_ADAPTER_BOTTLENECK):
         super().__init__()
         self.config = AutoConfig.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
@@ -267,7 +235,7 @@ class EnhancedMultiTaskTransformer(nn.Module):
         # attention pooling: produce per-aspect vectors
         self.attn_pool = AttentionPool(hidden_size=hidden, num_queries=num_aspects, num_heads=pool_heads, dropout=dropout)
 
-        # per-aspect adapters (shared module reused or separate? we use separate adapters)
+        # per-aspect adapters
         self.adapters = nn.ModuleList([Adapter(hidden, bottleneck=adapter_bottleneck, dropout=dropout) for _ in range(num_aspects)])
 
         # per-aspect segment heads (MLP)
@@ -283,56 +251,44 @@ class EnhancedMultiTaskTransformer(nn.Module):
             ) for _ in range(num_aspects)
         ])
 
-        # presence head: map per-aspect vector -> single logit (we'll apply per-aspect separately)
+        # presence heads: per-aspect small MLP -> single logit
         self.presence_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden, hidden_head // 4),
+                nn.Linear(hidden, max(64, hidden_head // 4)),
                 nn.ReLU(),
                 nn.Dropout(dropout),
-                nn.Linear(hidden_head // 4, 1)
+                nn.Linear(max(64, hidden_head // 4), 1)
             ) for _ in range(num_aspects)
         ])
 
-        # final layer norms
-        self.final_ln_seg = nn.LayerNorm(hidden)
         self.dropout = nn.Dropout(dropout)
-
-        # initialization niceties
         self._init_weights()
 
     def _init_weights(self):
-        # small init for adapters/heads to avoid large initial outputs
         for m in list(self.adapters) + list(self.segment_heads) + list(self.presence_heads):
             for p in m.parameters():
                 if p.dim() > 1:
                     nn.init.xavier_uniform_(p)
 
     def forward(self, input_ids, attention_mask):
-        # encoder
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         token_emb = out.last_hidden_state  # [B, T, H]
         token_emb = self.dropout(token_emb)
 
-        # attention pooling -> per-aspect vectors [B, A, H]
         pooled = self.attn_pool(token_emb)  # [B, A, H]
 
         seg_logits_per_aspect = []
         pres_logits_per_aspect = []
-        # iterate aspects
         for a in range(self.num_aspects):
-            vec = pooled[:, a, :]  # [B, H]
-            vec = self.adapters[a](vec)  # [B, H]
-            # seg
+            vec = pooled[:, a, :]
+            vec = self.adapters[a](vec)
             seg_logit = self.segment_heads[a](vec)  # [B, C]
-            seg_logits_per_aspect.append(seg_logit)
-            # presence
             pres_logit = self.presence_heads[a](vec).squeeze(-1)  # [B]
+            seg_logits_per_aspect.append(seg_logit)
             pres_logits_per_aspect.append(pres_logit)
 
-        # stack -> seg_logits [B, A, C], pres_logits [B, A]
-        seg_logits = torch.stack(seg_logits_per_aspect, dim=1)
-        pres_logits = torch.stack(pres_logits_per_aspect, dim=1)
-
+        seg_logits = torch.stack(seg_logits_per_aspect, dim=1)  # [B, A, C]
+        pres_logits = torch.stack(pres_logits_per_aspect, dim=1)  # [B, A]
         return seg_logits, pres_logits
 
 # ---------- Helpers: weights & sampler ----------
@@ -603,6 +559,9 @@ def main():
     parser.add_argument("--fp16", type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--grad_accum", type=int, default=GRAD_ACCUM_STEPS)
     parser.add_argument("--num_workers", type=int, default=NUM_WORKERS)
+    parser.add_argument("--hidden_head", type=int, default=ENH_HIDDEN_HEAD)
+    parser.add_argument("--adapter_bottleneck", type=int, default=ENH_ADAPTER_BOTTLENECK)
+    parser.add_argument("--pool_heads", type=int, default=ENH_POOL_HEADS)
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -629,21 +588,30 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
-    # model = MultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES)
     model = EnhancedMultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES,
-                                     hidden_head=512, pool_heads=8, dropout=0.2, adapter_bottleneck=128)
-
+                                         hidden_head=args.hidden_head, pool_heads=args.pool_heads,
+                                         dropout=0.2, adapter_bottleneck=args.adapter_bottleneck)
 
     per_aspect_weights = compute_per_aspect_weights(train, LABEL_COLS, NUM_SEGMENT_CLASSES)
 
-    # per-parameter LR
+    # per-parameter LR: encoder vs heads/adapters/presence
+    encoder_params = list(model.encoder.parameters())
+    head_params = []
+    # collect heads: segment_heads + presence_heads + adapters
+    for p in model.segment_heads.parameters():
+        head_params.append(p)
+    for p in model.presence_heads.parameters():
+        head_params.append(p)
+    for p in model.adapters.parameters():
+        head_params.append(p)
+
+    # flatten head_params into param groups
     optimizer = torch.optim.AdamW([
-        {'params': model.encoder.parameters(), 'lr': LR_ENCODER},
-        {'params': model.segment_heads.parameters(), 'lr': LR_HEADS},
-        {'params': model.presence_head.parameters(), 'lr': LR_HEADS}
+        {'params': encoder_params, 'lr': LR_ENCODER},
+        {'params': head_params, 'lr': LR_HEADS}
     ], weight_decay=WEIGHT_DECAY)
 
-    total_steps = len(train_loader) * NUM_EPOCHS // max(1, args.grad_accum)
+    total_steps = max(1, len(train_loader) * NUM_EPOCHS // max(1, args.grad_accum))
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.06 * total_steps), num_training_steps=total_steps)
 
     seg_loss_type = 'focal' if USE_FOCAL else 'ce'
@@ -657,7 +625,7 @@ def main():
     print("Test metrics:", test_metrics)
 
     # Save predictions
-    predict_and_save(model, test_loader, output_path="data/predictions.csv", device=DEVICE)
+    predict_and_save(model, test_loader, output_path=str(data_dir/"predictions.csv"), device=DEVICE)
 
 if __name__ == "__main__":
     main()
