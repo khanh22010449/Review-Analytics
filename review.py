@@ -172,7 +172,7 @@ def main():
     parser.add_argument('--use_pyvi', action='store_true', help='Use PyVi Vietnamese tokenizer (pure Python)')
     args = parser.parse_args()
 
-    text_col = 'text'
+    text_col = 'Review'
     aspect_cols = ['entertainment','hotel','restaurant','transport','shopping','food']
 
     if args.mode == 'train':
