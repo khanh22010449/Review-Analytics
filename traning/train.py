@@ -25,7 +25,7 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
 # Segmenter input
-rdrsegmenter = VnCoreNLP("vncorenlp/VnCoreNLP-1.1.1.jar", annotators="wseg", max_heap_size='-Xmx500m') 
+rdrsegmenter = VnCoreNLP("VnCoreNLP-1.1.1.jar", annotators="wseg", max_heap_size='-Xmx500m') 
 
 # Tokenizer
 tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base")
