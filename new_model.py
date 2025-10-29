@@ -39,7 +39,7 @@ MAX_LEN = 256
 BATCH_SIZE = 16
 LR_ENCODER = 1e-5
 LR_HEADS = 1e-4
-NUM_EPOCHS = 10
+NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LABEL_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
 NUM_ASPECTS = len(LABEL_COLS)
@@ -53,7 +53,7 @@ NUM_WORKERS = 4
 GRAD_ACCUM_STEPS = 1
 WEIGHT_DECAY = 0.01
 FREEZE_ENCODER_EPOCHS = 1
-SAMPLE_POWER = 1.0  # -> adjustable oversample exponent
+SAMPLE_POWER = 1.5  # -> adjustable oversample exponent
 # --------------------------------------------------
 
 def seed_everything(seed=42):
@@ -587,7 +587,7 @@ def predict_and_save_with_thresholds(model, data_loader, thresholds, output_path
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data")
-    parser.add_argument("--do_augment", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--do_augment", type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--bt_mid", type=str, default=AUG_TGT_LANG)
     parser.add_argument("--aug_cache_dir", type=str, default=CACHE_DIR)
     parser.add_argument("--fp16", type=lambda x: x.lower() == "true", default=True)
