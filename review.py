@@ -173,7 +173,7 @@ def main():
     args = parser.parse_args()
 
     text_col = 'Review'
-    aspect_cols = ['entertainment','hotel','restaurant','transport','shopping','food']
+    aspect_cols = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
 
     if args.mode == 'train':
         train_df = pd.read_csv(args.train_csv)
