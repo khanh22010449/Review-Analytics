@@ -42,7 +42,7 @@ MAX_LEN = 256
 BATCH_SIZE = 16
 LR_ENCODER = 1e-5
 LR_HEADS = 1e-4
-NUM_EPOCHS = 8
+NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LABEL_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
 NUM_ASPECTS = len(LABEL_COLS)
@@ -632,7 +632,7 @@ def ensemble_predict_models(model_paths, tokenizer, test_df, output_csv="ensembl
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data")
-    parser.add_argument("--do_augment", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--do_augment", type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--bt_mid", type=str, default=AUG_TGT_LANG)
     parser.add_argument("--aug_cache_dir", type=str, default=CACHE_DIR)
     parser.add_argument("--fp16", type=lambda x: x.lower() == "true", default=True)
