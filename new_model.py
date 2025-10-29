@@ -127,9 +127,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="data")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--pseudo_weight", type=float, default=0.4, help="loss weight for pseudo samples (0..1)")
     args = parser.parse_args()
 
