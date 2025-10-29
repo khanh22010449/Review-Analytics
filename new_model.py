@@ -479,7 +479,6 @@ def main():
     parser.add_argument("--fgamma", type=float, default=1.5)
     parser.add_argument("--w_seg", type=float, default=1.5)
     parser.add_argument("--w_pres", type=float, default=1.0)
-    parser.add_argument("--grad_accum", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
