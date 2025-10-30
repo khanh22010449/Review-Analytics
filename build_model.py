@@ -21,7 +21,7 @@ import joblib
 from tqdm import tqdm
 
 # Optional W2V
-USE_W2V = True
+USE_W2V = False
 try:
     if USE_W2V:
         from gensim.models import Word2Vec
