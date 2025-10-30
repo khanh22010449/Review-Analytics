@@ -1,11 +1,3 @@
-"""
-Train_and_Test_fixed.py
-Bản sửa hoàn chỉnh của Train_and_Test.py với hỗ trợ Word2Vec và alignment features.
-- Đảm bảo mọi bước (train / eval / predict) ghép W2V giống nhau.
-- Hàm align_features sẽ trim hoặc pad features để phù hợp với model đã lưu.
-
-Cách dùng giống file trước.
-"""
 import argparse
 import os
 import json

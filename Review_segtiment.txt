@@ -13,13 +13,13 @@ Structure of Model:
            |                                            |
            v                                            v
 [Preprocessing / Column check]                [Preprocessing / Column check]
- (strip col names, fillna text)                     (ensure 'stt', text)
+ (strip col names, fillna text)                     (ensure 'stt', review)
            |                                            |
            v                                            v
 [Train/Val split (train_df / val_df)]                   |
            |                                            |
            v                                            v
-[Tokenizer with BPE)]  <---------- same vectorizer fitted on train
+[Tokenizer with BPE, words)]  <---------- same vectorizer fitted on train
            |
            v
 [Document vectors: Word2vec]
@@ -30,7 +30,7 @@ Structure of Model:
 |  1) Presence classifier (LogisticRegression)  |  <-- Binary Relevance (BR) presence
 |     - target: (rating > 0) ? 1 : 0            |
 |  2) If enough positive samples:               |
-|     Sentiment classifier (LogisticRegression) |  <-- multi-class 1..5 on positives
+|     Sentiment classifier (NN) |  <-- multi-class 1..5 on positives
 +-----------------------------------------------+
            |
            v
