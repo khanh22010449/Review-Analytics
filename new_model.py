@@ -1,654 +1,439 @@
-# new_model_improved.py
+#!/usr/bin/env python3
+# train_then_predict.py
 """
-Improved version of your model/training script focused on improving:
- - seg_f1_macro_mean and seg_acc_mean
-Key improvements:
- - vectorized segmentation loss with per-aspect class weights
- - presence BCEWithLogitsLoss with per-aspect pos_weight
- - per-aspect threshold tuning on validation
- - device-safe numpy->tensor handling
- - sampler power (control oversampling)
- - more detailed per-aspect metrics and checkpointing
-"""
-import os
-import argparse
-import random
-import math
-import json
-from pathlib import Path
-from tqdm.auto import tqdm
+Train MultiTaskTransformer and optional CustomModelRegressor, then run prediction and save CSV.
 
+Usage examples:
+  Train MT and predict:
+    python train_then_predict.py --do_train_mt --train data/train.csv --val data/val.csv --mt_out best_mt.pt --epochs 5 \
+      --do_predict --test data/problem_test.csv --out data/predict.csv --mt_checkpoint best_mt.pt
+
+  Train regressor and predict combined:
+    python train_then_predict.py --do_train_reg --train data/train.csv --val data/val.csv --reg_out best_reg.pt \
+      --do_predict --test data/problem_test.csv --out data/predict.csv --mt_checkpoint best_mt.pt --reg_checkpoint best_reg.pt
+"""
+
+import argparse
+from pathlib import Path
+import os
+import copy
+import time
+import math
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer, AutoModel, AutoConfig
+import torch.optim as optim
 
-from transformers import (AutoTokenizer, AutoModel, AutoConfig,
-                          get_linear_schedule_with_warmup,
-                          MarianMTModel, MarianTokenizer)
+# Try import from user-provided new_model.py
+try:
+    from new_model import MultiTaskTransformer, ReviewDataset, collate_fn, LABEL_COLS, NUM_SEGMENT_CLASSES, MODEL_NAME, MAX_LEN, BATCH_SIZE
+except Exception as e:
+    # Provide fallback definitions if some names are missing
+    print("Warning importing from new_model.py:", e)
+    # MultiTaskTransformer must exist in new_model.py or training will fail
+    try:
+        from new_model import MultiTaskTransformer
+    except Exception as e2:
+        raise ImportError("MultiTaskTransformer not found in new_model.py. Please ensure new_model.py defines MultiTaskTransformer.") from e2
 
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, precision_recall_fscore_support
-
-# ---------------- Config (defaults) ----------------
-MODEL_NAME = "vinai/phobert-base"
-MAX_LEN = 256
-BATCH_SIZE = 16
-LR_ENCODER = 1e-5
-LR_HEADS = 1e-4
-NUM_EPOCHS = 50
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-LABEL_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
-NUM_ASPECTS = len(LABEL_COLS)
-NUM_SEGMENT_CLASSES = 5
-USE_FOCAL = True
-FGAMMA = 1.5
-CACHE_DIR = "bt_cache"
-AUG_TGT_LANG = "en"   # Vi -> En -> Vi back-translation
-BT_BATCH = 16         # batch size for translation generation
-NUM_WORKERS = 4
-GRAD_ACCUM_STEPS = 1
-WEIGHT_DECAY = 0.01
-FREEZE_ENCODER_EPOCHS = 1
-SAMPLE_POWER = 1.5  # -> adjustable oversample exponent
-# --------------------------------------------------
-
-def seed_everything(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-seed_everything(42)
-
-import re, html
-from bs4 import BeautifulSoup
-def clean_text(text: str) -> str:
-    text = BeautifulSoup(str(text), "html.parser").get_text()
-    text = html.unescape(text)
-    text = re.sub(r"[^a-zA-Z0-9À-Ỹà-ỹ\s.,!?;:'\"%&$()\-]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-class ReviewDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, tokenizer, max_len=256, label_cols=LABEL_COLS,
-                 augment_fn=None, augment_prob=0.0, augment_minority_only=False, minority_map=None,
-                 use_segmentation_fn=None):
-        self.df = df.reset_index(drop=True)
-        self.texts = self.df['Review'].astype(str).tolist()
-        self.labels = self.df[label_cols].values  # 0..5
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        self.augment_fn = augment_fn
-        self.augment_prob = augment_prob
-        self.augment_minority_only = augment_minority_only
-        self.minority_map = minority_map or {}
-        self.use_segmentation_fn = use_segmentation_fn
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        row_labels = self.labels[idx].astype(np.int64)  # 0..5
-
-        if self.augment_fn and random.random() < self.augment_prob:
-            if not self.augment_minority_only:
-                text = self.augment_fn(text)
+    # Fallback small dataset that expects label columns present in train CSV
+    class ReviewDataset(Dataset):
+        def __init__(self, df, tokenizer, max_len=256, label_cols=None, is_train=True):
+            self.df = df.reset_index(drop=True)
+            self.tokenizer = tokenizer
+            self.max_len = max_len
+            self.texts = self.df.get("Review", self.df.get("review", self.df.get("text", [""] * len(self.df)))).astype(str).tolist()
+            self.is_train = is_train
+            self.label_cols = label_cols or ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
+            if self.is_train:
+                # Expect label columns exist and are 0..K ints
+                self.labels = self.df[self.label_cols].fillna(0).astype(int).values
             else:
-                do_aug = False
-                for i, col in enumerate(LABEL_COLS):
-                    val = row_labels[i]
-                    if val > 0 and val-1 in self.minority_map.get(col, set()):
-                        do_aug = True
-                        break
-                if do_aug:
-                    text = self.augment_fn(text)
+                self.labels = None
+        def __len__(self):
+            return len(self.texts)
+        def __getitem__(self, idx):
+            t = self.texts[idx]
+            tok = self.tokenizer(t, truncation=True, padding='max_length', max_length=self.max_len, return_tensors='pt')
+            item = {
+                "input_ids": tok["input_ids"].squeeze(0),
+                "attention_mask": tok["attention_mask"].squeeze(0),
+            }
+            if self.is_train:
+                item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+            return item
 
-        text = clean_text(text)
-        if self.use_segmentation_fn:
-            try:
-                text = self.use_segmentation_fn(text)
-            except Exception:
-                pass
+    def collate_fn(batch):
+        input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
+        attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
+        out = {"input_ids": input_ids, "attention_mask": attention_mask}
+        if "labels" in batch[0]:
+            labels = torch.stack([b["labels"] for b in batch], dim=0)
+            out["labels"] = labels
+        return out
 
-        tok = self.tokenizer(text, truncation=True, padding='max_length', max_length=self.max_len, return_tensors='pt')
-        seg_labels_raw = row_labels
-        pres_labels = (seg_labels_raw > 0).astype(np.float32)
-        seg_labels = np.where(seg_labels_raw > 0, seg_labels_raw - 1, -1)
+    LABEL_COLS = ['giai_tri','luu_tru','nha_hang','an_uong','van_chuyen','mua_sam']
+    NUM_SEGMENT_CLASSES = 5
+    MODEL_NAME = "bert-base-uncased"
+    MAX_LEN = 256
+    BATCH_SIZE = 32
 
-        return {
-            'input_ids': tok['input_ids'].squeeze(0),
-            'attention_mask': tok['attention_mask'].squeeze(0),
-            'seg_labels': torch.tensor(seg_labels, dtype=torch.long),
-            'pres_labels': torch.tensor(pres_labels, dtype=torch.float)
-        }
-
-def collate_fn(batch):
-    input_ids = torch.stack([x['input_ids'] for x in batch])
-    attention_mask = torch.stack([x['attention_mask'] for x in batch])
-    seg_labels = torch.stack([x['seg_labels'] for x in batch])
-    pres_labels = torch.stack([x['pres_labels'] for x in batch])
-    return {'input_ids': input_ids, 'attention_mask': attention_mask, 'seg_labels': seg_labels, 'pres_labels': pres_labels}
-
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None, ignore_index=-1, reduction='mean'):
-        super().__init__()
-        self.gamma = gamma
-        self.weight = weight
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-        self.ce = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
-
-    def forward(self, logits, target):
-        loss = self.ce(logits, target)  # per-sample
-        if self.ignore_index is not None:
-            mask = (target != self.ignore_index).float()
-            loss = loss * mask
-        else:
-            mask = torch.ones_like(loss)
-        pt = torch.exp(-loss)
-        focal = ((1 - pt) ** self.gamma) * loss
-        if self.reduction == 'mean':
-            denom = mask.sum().clamp_min(1.0)
-            return focal.sum() / denom
-        elif self.reduction == 'sum':
-            return focal.sum()
-        else:
-            return focal
-
-class MultiTaskTransformer(nn.Module):
-    def __init__(self, model_name, num_aspects, num_seg_classes, hidden_head=256, dropout=0.1, use_concat_hidden=True):
-        super().__init__()
-        if use_concat_hidden:
-            self.config = AutoConfig.from_pretrained(model_name, output_hidden_states=True)
-        else:
-            self.config = AutoConfig.from_pretrained(model_name, output_hidden_states=False)
-        # --- CHANGED: use from_pretrained to load weights
-        self.encoder = AutoModel.from_pretrained(model_name, config=self.config)
-        base_hidden = self.config.hidden_size
-        self.use_concat_hidden = use_concat_hidden
-        hidden = base_hidden * 4 if use_concat_hidden else base_hidden
-
-        self.num_aspects = num_aspects
-        self.num_seg_classes = num_seg_classes
-
-        self.segment_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden, hidden_head),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_head, num_seg_classes)
-            ) for _ in range(num_aspects)
-        ])
-        self.presence_head = nn.Linear(hidden, num_aspects)
-        self.regressor_head = nn.Sequential(
-            nn.Linear(hidden, hidden_head),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_head, num_aspects),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, input_ids, attention_mask):
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        if self.use_concat_hidden and hasattr(out, "hidden_states") and out.hidden_states is not None:
-            hs = out.hidden_states
-            pooled = torch.cat([hs[-1][:,0,:], hs[-2][:,0,:], hs[-3][:,0,:], hs[-4][:,0,:]], dim=-1)
-        else:
-            pooled = out.pooler_output if hasattr(out, "pooler_output") and out.pooler_output is not None else out.last_hidden_state[:,0,:]
-
+# Define CustomModelRegressor from user's snippet (frozen encoder + linear head)
+class CustomModelRegressor(nn.Module):
+    def __init__(self, checkpoint, num_outputs):
+        super(CustomModelRegressor, self).__init__()
+        self.num_outputs = num_outputs
+        config = AutoConfig.from_pretrained(checkpoint, output_attentions=True, output_hidden_states=True)
+        self.model = AutoModel.from_pretrained(checkpoint, config=config)
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        self.dropout = nn.Dropout(0.1)
+        hidden_size = getattr(self.model.config, "hidden_size", 768)
+        self.output1 = nn.Linear(hidden_size * 4, num_outputs)
+    def forward(self, input_ids=None, attention_mask=None):
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        hs = outputs.hidden_states  # tuple of (layer_count, B, seq_len, hidden)
+        # take last 4 layers' [CLS] token
+        pooled = torch.cat((hs[-1][:,0,:], hs[-2][:,0,:], hs[-3][:,0,:], hs[-4][:,0,:]), dim=-1)
         pooled = self.dropout(pooled)
-        seg_logits = torch.stack([head(pooled) for head in self.segment_heads], dim=1)  # [B,A,C]
-        pres_logits = self.presence_head(pooled)  # raw logits
-        reg_raw = self.regressor_head(pooled)
-        reg_scores = torch.sigmoid(reg_raw) * 4.0 + 1.0
-        return seg_logits, pres_logits, reg_scores
+        out = self.output1(pooled)  # shape (B, num_outputs)
+        out = torch.sigmoid(out) * 5.0
+        return out
 
-# --- CHANGED: vectorized segmentation loss using per-aspect class weights
-def loss_seg_vectorized(seg_logits, seg_labels, per_aspect_weights, device):
-    """
-    seg_logits: [B, A, C]
-    seg_labels: [B, A] with -1 for absent, 0..C-1 for present
-    per_aspect_weights: list of length A of torch tensors (C,) or None
-    """
-    B, A, C = seg_logits.shape
-    logits_flat = seg_logits.view(-1, C)
-    labels_flat = seg_labels.view(-1).to(device).long()
-    # Build weight vector for each flattened item (if available)
-    # We'll compute loss per-aspect by slicing; simpler: compute per-aspect loss and average
-    loss_sum = 0.0
-    valid_total = 0
-    for a in range(A):
-        start = a * B
-        slice_logits = logits_flat[start:start+B, :]
-        slice_labels = labels_flat[start:start+B]
-        weight = per_aspect_weights[a].to(device) if (per_aspect_weights and per_aspect_weights[a] is not None) else None
-        criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=-1, reduction='sum')
-        l = criterion(slice_logits, slice_labels)
-        valid = (slice_labels != -1).sum().item()
-        if valid > 0:
-            loss_sum += l
-            valid_total += valid
-    if valid_total == 0:
-        return torch.tensor(0.0, device=device)
-    return loss_sum / valid_total
+# Utilities for checkpoint loading/saving
+def load_state_dict_flexible(model, path, map_location="cpu"):
+    sd = torch.load(path, map_location=map_location)
+    # common wrappers
+    if isinstance(sd, dict) and "model_state" in sd:
+        sd = sd["model_state"]
+    # remove module. prefix
+    if isinstance(sd, dict) and any(k.startswith("module.") for k in sd.keys()):
+        sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=False)
+    return model
 
-# presence pos_weight compute
-def compute_presence_pos_weight(df, label_cols):
-    pos_counts = []
-    neg_counts = []
-    n = len(df)
-    for col in label_cols:
-        pos = int((df[col] > 0).sum())
-        neg = n - pos
-        pos_counts.append(pos)
-        neg_counts.append(neg)
-    # pos_weight = neg/pos for BCEWithLogitsLoss (torch expects a tensor of shape (num_classes,))
-    pos_weight = []
-    for pos, neg in zip(pos_counts, neg_counts):
-        if pos == 0:
-            pos_weight.append(1.0)
-        else:
-            pos_weight.append(max(1.0, neg / (pos + 1e-9)))
-    return torch.tensor(pos_weight, dtype=torch.float)
+# Training function for MultiTaskTransformer
+def train_mt(train_csv, val_csv, model_out, epochs=3, batch_size=32, lr=2e-5, device="cuda"):
+    print("Train MT: train=", train_csv, "val=", val_csv, "out=", model_out)
+    df_train = pd.read_csv(train_csv)
+    df_val = pd.read_csv(val_csv)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    train_ds = ReviewDataset(df_train, tokenizer, max_len=MAX_LEN, label_cols=LABEL_COLS, is_train=True)
+    val_ds = ReviewDataset(df_val, tokenizer, max_len=MAX_LEN, label_cols=LABEL_COLS, is_train=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-def compute_per_aspect_weights(train_df, label_cols, num_seg_classes):
-    weights_list = []
-    for col in label_cols:
-        vals = train_df[col].values
-        vals_pos = vals[vals > 0]
-        if len(vals_pos) == 0:
-            weights_list.append(None)
-            continue
-        mapped = (vals_pos - 1).astype(int)
-        classes = np.arange(num_seg_classes)
-        cw = compute_class_weight(class_weight='balanced', classes=classes, y=mapped)
-        cw = torch.tensor(cw, dtype=torch.float)
-        weights_list.append(cw)
-    return weights_list
-
-def make_multi_aspect_sampler(df, label_cols, num_seg_classes, power=1.0):
-    n = len(df)
-    sample_weights = np.zeros(n, dtype=float)
-    for col in label_cols:
-        vals = df[col].values
-        mapped = np.where(vals > 0, vals-1, -1)
-        counts = {}
-        for c in range(num_seg_classes):
-            counts[c] = np.sum(mapped == c)
-        col_weights = np.array([0.1 if v==-1 else (1.0/(counts[int(v)]+1e-9))**power for v in mapped])
-        sample_weights = np.maximum(sample_weights, col_weights)
-    sample_weights = sample_weights / (sample_weights.mean() + 1e-12)
-    return WeightedRandomSampler(weights=sample_weights.tolist(), num_samples=n, replacement=True)
-
-# metrics with per-aspect reporting
-def compute_metrics_seg_and_pres(seg_logits, pres_logits, seg_targets, pres_targets, threshold=0.5):
-    seg_preds = torch.argmax(seg_logits, dim=-1).cpu().numpy()
-    seg_true = seg_targets.cpu().numpy()
-    pres_probs = torch.sigmoid(pres_logits).cpu().numpy()
-    pres_preds = (pres_probs >= threshold).astype(int)
-    pres_true = pres_targets.cpu().numpy().astype(int)
-
-    metrics = {}
-    accs, f1s_seg = [], []
-    per_aspect = {}
-    for a in range(seg_true.shape[1]):
-        mask = seg_true[:, a] != -1
-        if np.sum(mask) == 0:
-            per_aspect[LABEL_COLS[a]] = {'acc': None, 'f1_macro': None}
-            continue
-        acc = accuracy_score(seg_true[mask,a], seg_preds[mask,a])
-        f1m = f1_score(seg_true[mask,a], seg_preds[mask,a], average='macro', zero_division=0)
-        accs.append(acc)
-        f1s_seg.append(f1m)
-        per_aspect[LABEL_COLS[a]] = {'acc': float(acc), 'f1_macro': float(f1m)}
-    metrics['seg_acc_mean'] = float(np.mean(accs) if accs else 0.0)
-    metrics['seg_f1_macro_mean'] = float(np.mean(f1s_seg) if f1s_seg else 0.0)
-    metrics['pres_f1_micro'] = float(f1_score(pres_true.reshape(-1), pres_preds.reshape(-1), average='micro', zero_division=0))
-    metrics['pres_f1_macro'] = float(f1_score(pres_true.reshape(-1), pres_preds.reshape(-1), average='macro', zero_division=0))
-    metrics['per_aspect'] = per_aspect
-    return metrics
-
-def score_to_tensor(score_np):
-    score = np.clip(score_np, 1.0, 5.0)
-    s = score - 1.0
-    N, A = s.shape
-    tensor = np.zeros((N, A, 5), dtype=float)
-    lower = np.floor(s).astype(int)
-    upper = np.ceil(s).astype(int)
-    frac = s - lower
-    for i in range(N):
-        for j in range(A):
-            l = lower[i,j]
-            u = upper[i,j]
-            if l == u:
-                tensor[i,j,l] = 1.0
-            else:
-                tensor[i,j,l] += 1.0 - frac[i,j]
-                tensor[i,j,u] += frac[i,j]
-    return tensor
-
-# BT functions kept as before (omitted here for brevity) - use your current implementations
-def prepare_bt_models(src='vi', mid='en', cache_dir=CACHE_DIR):
-    os.makedirs(cache_dir, exist_ok=True)
-    name_1 = f'Helsinki-NLP/opus-mt-{src}-{mid}'
-    name_2 = f'Helsinki-NLP/opus-mt-{mid}-{src}'
-    tok1 = MarianTokenizer.from_pretrained(name_1, cache_dir=cache_dir)
-    m1 = MarianMTModel.from_pretrained(name_1, cache_dir=cache_dir)
-    tok2 = MarianTokenizer.from_pretrained(name_2, cache_dir=cache_dir)
-    m2 = MarianMTModel.from_pretrained(name_2, cache_dir=cache_dir)
-    return (tok1, m1), (tok2, m2)
-
-def back_translate_texts(texts, model_pair, batch_size=16, device=None):
-    (tok1, m1), (tok2, m2) = model_pair
-    if device:
-        m1.to(device); m2.to(device)
-    results = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
-        inputs = tok1(batch_texts, return_tensors="pt", padding=True, truncation=True).to(m1.device)
-        with torch.no_grad():
-            out = m1.generate(**inputs, num_beams=4, max_length=256)
-            mids = tok1.batch_decode(out, skip_special_tokens=True)
-        inputs2 = tok2(mids, return_tensors="pt", padding=True, truncation=True).to(m2.device)
-        with torch.no_grad():
-            out2 = m2.generate(**inputs2, num_beams=4, max_length=256)
-            backs = tok2.batch_decode(out2, skip_special_tokens=True)
-        results.extend(backs)
-    return results
-
-def do_offline_back_translation(train_df, cache_dir=CACHE_DIR, mid_lang=AUG_TGT_LANG, bt_batch=BT_BATCH, device=None):
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_meta = Path(cache_dir) / "bt_meta.json"
-    cached_csv = Path(cache_dir) / "train_aug_bt.csv"
-    if cached_csv.exists():
-        print("Found cached augmented file:", cached_csv)
-        return str(cached_csv)
-    model_pair = prepare_bt_models(src='vi', mid=mid_lang, cache_dir=cache_dir)
-    texts = train_df['Review'].astype(str).tolist()
-    bt_texts = back_translate_texts(texts, model_pair, batch_size=bt_batch, device=device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if len(bt_texts) != len(texts):
-        raise RuntimeError("Mismatch bt lengths")
-    aug_filtered = []
-    for orig, bt in zip(texts, bt_texts):
-        if bt is None or str(bt).strip() == "" or str(bt).strip() == str(orig).strip():
-            aug_filtered.append(orig)
-        else:
-            aug_filtered.append(bt)
-    df_aug = train_df.copy()
-    df_aug['Review'] = aug_filtered
-    df_concat = pd.concat([train_df, df_aug], ignore_index=True).sample(frac=1, random_state=42).reset_index(drop=True)
-    df_concat.to_csv(cached_csv, index=False)
-    with open(cache_meta, "w") as f:
-        json.dump({"src": "vi", "mid": mid_lang, "n_orig": len(train_df), "n_aug": len(df_aug)}, f)
-    return str(cached_csv)
-
-def validate(val_loader, model, device='cpu', thresholds=None):
-    model.eval()
-    seg_logits_all, pres_logits_all, seg_t_all, pres_t_all = [], [], [], []
-    reg_all = []
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Valid", leave=False):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            seg_labels = batch['seg_labels'].to(device)
-            pres_labels = batch['pres_labels'].to(device)
-            seg_logits, pres_logits, reg_scores = model(input_ids=input_ids, attention_mask=attention_mask)
-            seg_logits_all.append(seg_logits.cpu())
-            pres_logits_all.append(pres_logits.cpu())
-            reg_all.append(reg_scores.cpu())
-            seg_t_all.append(seg_labels.cpu())
-            pres_t_all.append(pres_labels.cpu())
-    seg_logits = torch.cat(seg_logits_all)
-    pres_logits = torch.cat(pres_logits_all)
-    reg_scores = torch.cat(reg_all)
-    seg_t = torch.cat(seg_t_all)
-    pres_t = torch.cat(pres_t_all)
-    # if thresholds provided, use them; otherwise use 0.5
-    th = thresholds if thresholds is not None else np.array([0.5]*NUM_ASPECTS)
-    metrics = compute_metrics_seg_and_pres(seg_logits, pres_logits, seg_t, pres_t, threshold=0.5)  # pres threshold fixed here for seg metrics computation
-    # add reg mse
-    mask = (seg_t != -1)
-    if mask.sum() > 0:
-        preds = reg_scores.cpu().numpy()
-        targets = (seg_t.cpu().numpy() + 1.0)
-        mse = ((preds - targets)**2 * mask.numpy()).sum() / (mask.sum() + 1e-12)
-        metrics['reg_mse'] = float(mse)
-    else:
-        metrics['reg_mse'] = None
-    return metrics, seg_logits, pres_logits, reg_scores, seg_t, pres_t
-
-def tune_thresholds_on_val(seg_logits, pres_probs, pres_true):
-    # tune per-aspect presence threshold by maximizing F1 on val
-    best_thresh = []
-    pres_probs = pres_probs.copy()
-    pres_true = pres_true.copy().astype(int)
-    for a in range(pres_probs.shape[1]):
-        best_t = 0.5
-        best_f1 = -1
-        for t in np.linspace(0.2, 0.8, 31):
-            preds = (pres_probs[:,a] >= t).astype(int)
-            f1 = f1_score(pres_true[:,a], preds, zero_division=0)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_t = t
-        best_thresh.append(best_t)
-    return np.array(best_thresh)
-
-def train_loop_with_weights(train_loader, val_loader, model, optimizer, scheduler=None,
-               num_epochs=3, device='cpu', w_seg=1.0, w_pres=1.0, w_reg=0.5,
-               seg_loss_type='focal', per_aspect_weights=None, gamma=2.0,
-               freeze_encoder_epochs=0, grad_accum_steps=1, fp16=True, pos_weight_tensor=None):
+    model = MultiTaskTransformer(MODEL_NAME, num_aspects=len(LABEL_COLS), num_seg_classes=NUM_SEGMENT_CLASSES)
     model.to(device)
-    scaler = GradScaler() if fp16 and device == 'cuda' else None
-    # presence loss with pos_weight if provided
-    if pos_weight_tensor is not None:
-        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor.to(device))
-    else:
-        bce_loss = nn.BCEWithLogitsLoss()
 
-    best_val = None
-    global_step = 0
-    best_thresholds = np.array([0.5]*NUM_ASPECTS)
-
-    for epoch in range(num_epochs):
+    # losses: seg -> CrossEntropy per aspect, pres -> BCEWithLogits (multi-label)
+    ce = nn.CrossEntropyLoss()
+    bce = nn.BCEWithLogitsLoss()
+    optim = torch.optim.AdamW(model.parameters(), lr=lr)
+    best_score = -1e9
+    for ep in range(1, epochs+1):
         model.train()
-        if epoch < freeze_encoder_epochs:
-            for p in model.encoder.parameters():
-                p.requires_grad = False
-            print(f"Epoch {epoch+1}: encoder frozen")
-        else:
-            for p in model.encoder.parameters():
-                p.requires_grad = True
+        running = 0.0
+        t0 = time.time()
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)  # shape (B, A) ints 0..K
 
-        pbar = tqdm(train_loader, desc=f"Train E{epoch+1}")
-        total_loss = 0.0
-        optimizer.zero_grad()
-        for step, batch in enumerate(pbar):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            seg_labels = batch['seg_labels'].to(device)
-            pres_labels = batch['pres_labels'].to(device)
-
-            if scaler:
-                with autocast():
-                    seg_logits, pres_logits, reg_scores = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss_seg = loss_seg_vectorized(seg_logits, seg_labels, per_aspect_weights, device)
-                    loss_pres = bce_loss(pres_logits, pres_labels)
-                    # regressor loss on present
-                    mask = (seg_labels != -1).float()
-                    if mask.sum() > 0:
-                        target = (seg_labels.float() + 1.0) * mask
-                        pred = reg_scores * mask
-                        reg_loss = ((pred - target)**2).sum() / (mask.sum() + 1e-12)
-                    else:
-                        reg_loss = torch.tensor(0.0, device=device)
-                    loss = w_seg * loss_seg + w_pres * loss_pres + w_reg * reg_loss
-                scaler.scale(loss).backward()
-                if (step+1) % grad_accum_steps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    if scheduler is not None:
-                        scheduler.step()
-            else:
-                seg_logits, pres_logits, reg_scores = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss_seg = loss_seg_vectorized(seg_logits, seg_labels, per_aspect_weights, device)
-                loss_pres = bce_loss(pres_logits, pres_labels)
-                mask = (seg_labels != -1).float()
-                if mask.sum() > 0:
-                    target = (seg_labels.float() + 1.0) * mask
-                    pred = reg_scores * mask
-                    reg_loss = ((pred - target)**2).sum() / (mask.sum() + 1e-12)
+            optim.zero_grad()
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            # try extract seg_logits, pres_logits (robust)
+            seg_logits = None
+            pres_logits = None
+            if isinstance(outputs, dict):
+                seg_logits = outputs.get("seg_logits") or outputs.get("seg")
+                pres_logits = outputs.get("pres_logits") or outputs.get("pres")
+            elif isinstance(outputs, (list, tuple)):
+                tensors = [o for o in outputs if torch.is_tensor(o)]
+                if len(tensors) >= 2:
+                    seg_logits, pres_logits = tensors[0], tensors[1]
                 else:
-                    reg_loss = torch.tensor(0.0, device=device)
-                loss = w_seg * loss_seg + w_pres * loss_pres + w_reg * reg_loss
-                loss.backward()
-                if (step+1) % grad_accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    if scheduler is not None:
-                        scheduler.step()
+                    # try first two positions
+                    try:
+                        seg_logits, pres_logits = outputs[0], outputs[1]
+                    except Exception:
+                        raise RuntimeError("Cannot parse outputs from MultiTaskTransformer during train.")
+            else:
+                raise RuntimeError("Unsupported outputs type from MultiTaskTransformer.")
 
-            total_loss += float(loss.detach().cpu().item())
-            pbar.set_postfix({'loss': total_loss / (step+1)})
-            global_step += 1
+            # compute losses
+            # seg_logits shape: (B, A, C) ; labels: (B, A)
+            loss_seg = 0.0
+            B, A = labels.shape
+            for a in range(A):
+                loss_seg = loss_seg + ce(seg_logits[:, a, :], labels[:, a])
+            loss_seg = loss_seg / float(A)
 
-        # Validate and tune thresholds after each epoch
-        val_metrics, seg_logits_val, pres_logits_val, reg_val, seg_t_val, pres_t_val = validate(val_loader, model, device)
-        print(f"Epoch {epoch+1} val metrics (before threshold tuning):", val_metrics)
+            # pres_logits shape: (B, A) logits
+            pres_target = (labels > 0).float()  # presence if label > 0
+            loss_pres = bce(pres_logits, pres_target)
 
-        # tune thresholds on val (use pres probabilities)
-        pres_probs_np = torch.sigmoid(pres_logits_val).cpu().numpy()
-        pres_true_np = pres_t_val.cpu().numpy().astype(int)
-        thresholds = tune_thresholds_on_val(None, pres_probs_np, pres_true_np)
-        print("Tuned thresholds:", thresholds)
-        # re-evaluate metrics using new thresholds (we recompute pres predictions and seg metrics)
-        metrics_after = compute_metrics_seg_and_pres(seg_logits_val, pres_logits_val, seg_t_val, pres_t_val, threshold=thresholds.mean())  # keep seg evaluation stable
-        print(f"Epoch {epoch+1} val metrics (after tuning attempt):", metrics_after)
+            loss = loss_seg + loss_pres
+            # if model returns reg losses/outputs you can add MSE here (skip for now)
+            loss.backward()
+            optim.step()
+            running += loss.item()
 
-        # selection metric (you can choose combination)
-        score = val_metrics['pres_f1_micro'] + val_metrics['seg_f1_macro_mean']
-        if best_val is None or score > best_val:
-            best_val = score
-            torch.save({
-                'epoch': epoch+1,
-                'model_state': model.state_dict(),
-                'optim_state': optimizer.state_dict()
-            }, "best_multitask_weighted_improved.pt")
-            print("Saved best model.")
-            best_thresholds = thresholds.copy()
+        # validation
+        model.eval()
+        total_acc = []
+        total_mae = []
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                if isinstance(outputs, dict):
+                    seg_logits = outputs.get("seg_logits") or outputs.get("seg")
+                    pres_logits = outputs.get("pres_logits") or outputs.get("pres")
+                else:
+                    tensors = [o for o in outputs if torch.is_tensor(o)]
+                    seg_logits, pres_logits = tensors[0], tensors[1]
+                seg_preds = torch.argmax(seg_logits, dim=-1).cpu().numpy()  # (B,A)
+                pres_preds = (torch.sigmoid(pres_logits).cpu().numpy() >= 0.5).astype(int)
+                labels_np = labels.cpu().numpy()
+                # decode to final scores like inference: if pres==0 -> 0 else seg+1
+                B = labels_np.shape[0]
+                pred_scores = np.zeros_like(labels_np)
+                for i in range(B):
+                    for j in range(labels_np.shape[1]):
+                        if pres_preds[i, j] == 0:
+                            pred_scores[i, j] = 0
+                        else:
+                            pred_scores[i, j] = int(seg_preds[i, j]) + 1
+                acc = (pred_scores == labels_np).mean()
+                mae = np.mean(np.abs(pred_scores - labels_np))
+                total_acc.append(acc)
+                total_mae.append(mae)
+        mean_acc = float(np.mean(total_acc))
+        mean_mae = float(np.mean(total_mae))
+        score = mean_acc - 0.5 * mean_mae
+        print(f"Epoch {ep}/{epochs} train_loss={running/len(train_loader):.4f} val_acc={mean_acc:.4f} val_mae={mean_mae:.4f} score={score:.4f} time={(time.time()-t0):.1f}s")
+        if score > best_score:
+            best_score = score
+            torch.save(model.state_dict(), model_out)
+            print("Saved best MT checkpoint to", model_out)
+    return model_out
 
-    print("Training finished. Best score:", best_val, "best_thresholds:", best_thresholds)
-    return best_thresholds
+# Training function for CustomModelRegressor (train linear head)
+def train_regressor(train_csv, val_csv, reg_out, epochs=3, batch_size=32, lr=1e-3, device="cuda"):
+    print("Train regressor:", train_csv, val_csv, "->", reg_out)
+    df_train = pd.read_csv(train_csv)
+    df_val = pd.read_csv(val_csv)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # For regressor we can reuse ReviewDataset but with labels as float targets (0..5)
+    train_ds = ReviewDataset(df_train, tokenizer, max_len=MAX_LEN, label_cols=LABEL_COLS, is_train=True)
+    val_ds = ReviewDataset(df_val, tokenizer, max_len=MAX_LEN, label_cols=LABEL_COLS, is_train=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-def predict_and_save_with_thresholds(model, data_loader, thresholds, output_path="predictions.csv", device='cpu'):
-    model.to(device)
-    model.eval()
+    reg_model = CustomModelRegressor(MODEL_NAME, num_outputs=len(LABEL_COLS))
+    reg_model.to(device)
+    # Only train linear head
+    params = [p for n,p in reg_model.named_parameters() if p.requires_grad]
+    optimizer = optim.AdamW(params, lr=lr)
+    loss_fn = nn.L1Loss()
+
+    best_mae = 1e9
+    for ep in range(1, epochs+1):
+        reg_model.train()
+        running = 0.0
+        t0 = time.time()
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].float().to(device)  # (B,A) expected 0..5
+            optimizer.zero_grad()
+            preds = reg_model(input_ids=input_ids, attention_mask=attention_mask)  # (B,A)
+            loss = loss_fn(preds, labels)
+            loss.backward()
+            optimizer.step()
+            running += loss.item()
+        # val
+        reg_model.eval()
+        maes = []
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].float().to(device)
+                preds = reg_model(input_ids=input_ids, attention_mask=attention_mask)
+                mae = torch.mean(torch.abs(preds - labels)).item()
+                maes.append(mae)
+        mean_mae = float(np.mean(maes))
+        print(f"Epoch {ep}/{epochs} train_loss={running/len(train_loader):.4f} val_mae={mean_mae:.4f} time={(time.time()-t0):.1f}s")
+        if mean_mae < best_mae:
+            best_mae = mean_mae
+            torch.save(reg_model.state_dict(), reg_out)
+            print("Saved best regressor to", reg_out)
+    return reg_out
+
+# Combined prediction (MT +/- regressor) -> output CSV format required
+def predict(mt_checkpoint, test_csv, out_csv, device="cuda", reg_checkpoint=None):
+    print("Predict: mt_checkpoint=", mt_checkpoint, "reg_checkpoint=", reg_checkpoint, "test=", test_csv, "out=", out_csv)
+    df_test = pd.read_csv(test_csv)
+    if "stt" not in df_test.columns:
+        df_test.insert(0, "stt", range(1, len(df_test) + 1))
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # PredictDataset lightweight
+    class _PredDS(Dataset):
+        def __init__(self, df, tokenizer, max_len=MAX_LEN):
+            self.df = df.reset_index(drop=True)
+            self.texts = self.df.get("Review", self.df.get("review", self.df.get("text", [""] * len(self.df)))).astype(str).tolist()
+            self.tokenizer = tokenizer
+            self.max_len = max_len
+            self.stt = self.df["stt"].astype(int).tolist()
+        def __len__(self): return len(self.texts)
+        def __getitem__(self, idx):
+            tok = self.tokenizer(self.texts[idx], truncation=True, padding='max_length', max_length=self.max_len, return_tensors='pt')
+            return {"input_ids": tok["input_ids"].squeeze(0), "attention_mask": tok["attention_mask"].squeeze(0), "stt": self.stt[idx]}
+    ds = _PredDS(df_test, tokenizer, max_len=MAX_LEN)
+    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda b: {"input_ids": torch.stack([x["input_ids"] for x in b]), "attention_mask": torch.stack([x["attention_mask"] for x in b]), "stt": [x["stt"] for x in b]})
+
+    # load MT model
+    mt_model = MultiTaskTransformer(MODEL_NAME, num_aspects=len(LABEL_COLS), num_seg_classes=NUM_SEGMENT_CLASSES)
+    mt_model = load_state_dict_flexible(mt_model, mt_checkpoint, map_location=device)
+    mt_model.to(device)
+    mt_model.eval()
+
+    reg_model = None
+    if reg_checkpoint:
+        # instantiate regressor and load state if checkpoint exists
+        reg_model = CustomModelRegressor(MODEL_NAME, num_outputs=len(LABEL_COLS))
+        try:
+            reg_model = load_state_dict_flexible(reg_model, reg_checkpoint, map_location=device)
+        except Exception:
+            # maybe reg_checkpoint is model id - then CustomModelRegressor will load AutoModel weights from that id
+            try:
+                reg_model = CustomModelRegressor(reg_checkpoint, num_outputs=len(LABEL_COLS))
+            except Exception as e:
+                print("Warning: couldn't load regressor from", reg_checkpoint, "->", e)
+                reg_model = None
+        if reg_model is not None:
+            reg_model.to(device)
+            reg_model.eval()
+
     rows = []
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Predict"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            seg_logits, pres_logits, reg_scores = model(input_ids=input_ids, attention_mask=attention_mask)
-            seg_preds = torch.argmax(seg_logits, dim=-1).cpu().numpy()
-            pres_probs = torch.sigmoid(pres_logits).cpu().numpy()
-            pres_preds = (pres_probs >= thresholds).astype(int)
-            reg_np = reg_scores.cpu().numpy()
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            out_mt = mt_model(input_ids=input_ids, attention_mask=attention_mask)
+            # extract seg_logits and pres_logits robustly
+            seg_logits = None; pres_logits = None; reg_scores_mt = None
+            if isinstance(out_mt, dict):
+                seg_logits = out_mt.get("seg_logits") or out_mt.get("seg")
+                pres_logits = out_mt.get("pres_logits") or out_mt.get("pres")
+                reg_scores_mt = out_mt.get("reg_scores") or out_mt.get("reg")
+            elif isinstance(out_mt, (list, tuple)):
+                tensors = [o for o in out_mt if torch.is_tensor(o)]
+                if len(tensors) >= 2:
+                    seg_logits, pres_logits = tensors[0], tensors[1]
+                    if len(tensors) >= 3:
+                        reg_scores_mt = tensors[2]
+                else:
+                    # fallback: try positions
+                    try:
+                        seg_logits = out_mt[0]; pres_logits = out_mt[1]
+                        if len(out_mt) >= 3:
+                            reg_scores_mt = out_mt[2]
+                    except Exception:
+                        raise RuntimeError("Cannot parse mt_model outputs during predict.")
+
+            if seg_logits is None or pres_logits is None:
+                raise RuntimeError("seg_logits or pres_logits not found from MT model during predict.")
+
+            seg_logits = seg_logits.detach().cpu()
+            pres_logits = pres_logits.detach().cpu()
+            seg_preds = torch.argmax(seg_logits, dim=-1).numpy()  # (B, A)
+            pres_probs = torch.sigmoid(pres_logits).numpy()       # (B, A)
+            pres_preds = (pres_probs >= 0.5).astype(int)
+
+            # reg predictions from reg_model if provided, else from MT reg_scores if available
+            reg_preds_arr = None
+            if reg_model is not None:
+                reg_out = reg_model(input_ids=input_ids, attention_mask=attention_mask)  # (B, A)
+                reg_preds_arr = reg_out.detach().cpu().numpy()
+            elif reg_scores_mt is not None and torch.is_tensor(reg_scores_mt):
+                reg_preds_arr = reg_scores_mt.detach().cpu().numpy()
+
             B = seg_preds.shape[0]
             for i in range(B):
-                row = {}
+                stt = int(batch["stt"][i])
+                row = {"stt": stt}
                 for j, col in enumerate(LABEL_COLS):
-                    present = int(pres_preds[i,j])
-                    if present:
-                        seg_from_reg = int(np.round(np.clip(reg_np[i,j], 1.0, 5.0)))
-                        seg_cls = int(seg_preds[i,j]) + 1
-                        # combine regressor and classifier: prefer reg if differs from cls by <=1 else use cls
-                        if abs(seg_from_reg - seg_cls) <= 1:
-                            final_seg = int(round((seg_from_reg + seg_cls)/2.0))
-                        else:
-                            final_seg = seg_cls
+                    present = int(pres_preds[i, j])
+                    cls_val = int(seg_preds[i, j]) + 1  # classifier -> 1..C
+                    if reg_preds_arr is not None:
+                        reg_val = float(np.clip(reg_preds_arr[i, j], 0.0, 5.0))
                     else:
-                        final_seg = 0
-                    row[col] = final_seg
+                        reg_val = float(cls_val)
+                    reg_round = int(np.round(reg_val))
+                    reg_round = max(0, min(5, reg_round))
+                    if present == 0:
+                        outv = 0
+                    else:
+                        diff = abs(reg_round - cls_val)
+                        if diff <= 1:
+                            outv = int(round((reg_round + cls_val) / 2.0))
+                        else:
+                            outv = int(cls_val)
+                        outv = max(1, min(NUM_SEGMENT_CLASSES, outv))
+                    row[col] = outv
                 rows.append(row)
-    df_out = pd.DataFrame(rows)
-    df_out.to_csv(output_path, index=False)
-    print("Saved predictions to", output_path)
-    return output_path
+    df_out = pd.DataFrame(rows, columns=["stt"] + list(LABEL_COLS))
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(out_csv, index=False, encoding="utf-8")
+    print("Saved predictions to:", out_csv)
+    return out_csv
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="data")
-    parser.add_argument("--do_augment", type=lambda x: x.lower() == "true", default=True)
-    parser.add_argument("--bt_mid", type=str, default=AUG_TGT_LANG)
-    parser.add_argument("--aug_cache_dir", type=str, default=CACHE_DIR)
-    parser.add_argument("--fp16", type=lambda x: x.lower() == "true", default=True)
-    parser.add_argument("--grad_accum", type=int, default=GRAD_ACCUM_STEPS)
-    parser.add_argument("--num_workers", type=int, default=NUM_WORKERS)
-    parser.add_argument("--w_reg", type=float, default=0.5, help="weight for regressor loss")
-    parser.add_argument("--use_concat_hidden", type=lambda x: x.lower() == "true", default=True)
-    parser.add_argument("--sample_power", type=float, default=SAMPLE_POWER)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--do_train_mt", action="store_true")
+    p.add_argument("--do_train_reg", action="store_true")
+    p.add_argument("--do_predict", action="store_true")
+    p.add_argument("--train", type=str, help="Training CSV (must contain label cols)")
+    p.add_argument("--val", type=str, help="Validation CSV")
+    p.add_argument("--test", type=str, help="Test CSV (for prediction)")
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs_reg", type=int, default=3)
+    p.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--lr_reg", type=float, default=1e-3)
+    p.add_argument("--mt_out", type=str, default="best_mt.pt")
+    p.add_argument("--reg_out", type=str, default="best_reg.pt")
+    p.add_argument("--mt_checkpoint", type=str, default=None)
+    p.add_argument("--reg_checkpoint", type=str, default=None)
+    p.add_argument("--out", type=str, default="predict.csv")
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = p.parse_args()
 
-    data_dir = Path(args.data_dir)
-    train_csv = data_dir / "problem_train.csv"
-    val_csv = data_dir / "problem_val.csv"
-    test_csv = data_dir / "problem_test.csv"
+    device = args.device
+    if args.do_train_mt:
+        if not args.train or not args.val:
+            raise ValueError("Train and val CSV must be provided for training MT.")
+        train_mt(args.train, args.val, args.mt_out, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=device)
+        args.mt_checkpoint = args.mt_out
 
-    train = pd.read_csv(train_csv)
-    val = pd.read_csv(val_csv)
-    test = pd.read_csv(test_csv)
+    if args.do_train_reg:
+        if not args.train or not args.val:
+            raise ValueError("Train and val CSV must be provided for training regressor.")
+        train_regressor(args.train, args.val, args.reg_out, epochs=args.epochs_reg, batch_size=args.batch_size, lr=args.lr_reg, device=device)
+        args.reg_checkpoint = args.reg_out
 
-    if args.do_augment:
-        device_bt = "cuda" if torch.cuda.is_available() else "cpu"
-        aug_path = do_offline_back_translation(train, cache_dir=args.aug_cache_dir, mid_lang=args.bt_mid, bt_batch=BT_BATCH, device=device_bt)
-        train = pd.read_csv(aug_path)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    use_seg_fn = None
-
-    train_ds = ReviewDataset(train, tokenizer, max_len=MAX_LEN, use_segmentation_fn=use_seg_fn)
-    val_ds = ReviewDataset(val, tokenizer, max_len=MAX_LEN, use_segmentation_fn=use_seg_fn)
-    test_ds = ReviewDataset(test, tokenizer, max_len=MAX_LEN, use_segmentation_fn=use_seg_fn)
-
-    sampler = make_multi_aspect_sampler(train, LABEL_COLS, NUM_SEGMENT_CLASSES, power=args.sample_power)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=args.num_workers, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
-
-    model = MultiTaskTransformer(MODEL_NAME, num_aspects=NUM_ASPECTS, num_seg_classes=NUM_SEGMENT_CLASSES, use_concat_hidden=args.use_concat_hidden)
-
-    per_aspect_weights = compute_per_aspect_weights(train, LABEL_COLS, NUM_SEGMENT_CLASSES)
-    pos_weight_tensor = compute_presence_pos_weight(train, LABEL_COLS)
-
-    optimizer = torch.optim.AdamW([
-        {'params': model.encoder.parameters(), 'lr': LR_ENCODER},
-        {'params': model.segment_heads.parameters(), 'lr': LR_HEADS},
-        {'params': model.presence_head.parameters(), 'lr': LR_HEADS},
-        {'params': model.regressor_head.parameters(), 'lr': LR_HEADS}
-    ], weight_decay=WEIGHT_DECAY)
-
-    total_steps = max(1, len(train_loader) * NUM_EPOCHS // max(1, args.grad_accum))
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.06 * total_steps), num_training_steps=total_steps)
-
-    seg_loss_type = 'focal' if USE_FOCAL else 'ce'
-    thresholds = train_loop_with_weights(train_loader, val_loader, model, optimizer, scheduler,
-               num_epochs=NUM_EPOCHS, device=DEVICE, w_seg=1.5, w_pres=1.0,
-               seg_loss_type=seg_loss_type, per_aspect_weights=per_aspect_weights, gamma=FGAMMA,
-               freeze_encoder_epochs=FREEZE_ENCODER_EPOCHS, grad_accum_steps=args.grad_accum, fp16=args.fp16,
-               w_reg=args.w_reg, pos_weight_tensor=pos_weight_tensor)
-
-    print("Final thresholds to use for inference:", thresholds)
-    # final predict with thresholds
-    predict_and_save_with_thresholds(model, test_loader, thresholds, output_path="data/predictions_improved.csv", device=DEVICE)
+    if args.do_predict:
+        if args.mt_checkpoint is None:
+            raise ValueError("mt_checkpoint must be provided for prediction (use --mt_checkpoint or run --do_train_mt).")
+        predict(args.mt_checkpoint, args.test, args.out, device=device, reg_checkpoint=args.reg_checkpoint)
 
 if __name__ == "__main__":
     main()
